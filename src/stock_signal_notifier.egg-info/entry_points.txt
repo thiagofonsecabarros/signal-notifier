@@ -1,0 +1,2 @@
+[console_scripts]
+stock-notifier = stock_notifier.cli:main

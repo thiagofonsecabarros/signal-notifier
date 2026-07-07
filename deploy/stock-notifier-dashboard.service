@@ -1,0 +1,19 @@
+[Unit]
+Description=Stock Notifier Streamlit dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stocknotifier
+Group=stocknotifier
+WorkingDirectory=/opt/stock-notifier
+EnvironmentFile=/opt/stock-notifier/.env
+ExecStart=/opt/stock-notifier/.venv/bin/streamlit run src/stock_notifier/dashboard.py --server.address=127.0.0.1 --server.port=8501 --server.headless=true
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

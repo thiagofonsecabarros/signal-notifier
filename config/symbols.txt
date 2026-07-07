@@ -1,0 +1,53 @@
+# ticker,name,asset_type,exchange
+AAPL,Apple Inc.,stock,NASDAQ
+MSFT,Microsoft Corp.,stock,NASDAQ
+NVDA,NVIDIA Corp.,stock,NASDAQ
+AMZN,Amazon.com Inc.,stock,NASDAQ
+GOOGL,Alphabet Inc. Class A,stock,NASDAQ
+GOOG,Alphabet Inc. Class C,stock,NASDAQ
+META,Meta Platforms Inc.,stock,NASDAQ
+TSLA,Tesla Inc.,stock,NASDAQ
+AVGO,Broadcom Inc.,stock,NASDAQ
+BRK.B,Berkshire Hathaway Class B,stock,NYSE
+JPM,JPMorgan Chase & Co.,stock,NYSE
+V,Visa Inc.,stock,NYSE
+MA,Mastercard Inc.,stock,NYSE
+LLY,Eli Lilly and Co.,stock,NYSE
+UNH,UnitedHealth Group Inc.,stock,NYSE
+XOM,Exxon Mobil Corp.,stock,NYSE
+JNJ,Johnson & Johnson,stock,NYSE
+WMT,Walmart Inc.,stock,NYSE
+PG,Procter & Gamble Co.,stock,NYSE
+HD,Home Depot Inc.,stock,NYSE
+COST,Costco Wholesale Corp.,stock,NASDAQ
+ORCL,Oracle Corp.,stock,NYSE
+CRM,Salesforce Inc.,stock,NYSE
+NFLX,Netflix Inc.,stock,NASDAQ
+AMD,Advanced Micro Devices Inc.,stock,NASDAQ
+ADBE,Adobe Inc.,stock,NASDAQ
+QCOM,QUALCOMM Inc.,stock,NASDAQ
+INTC,Intel Corp.,stock,NASDAQ
+IBM,International Business Machines Corp.,stock,NYSE
+BAC,Bank of America Corp.,stock,NYSE
+GS,Goldman Sachs Group Inc.,stock,NYSE
+CVX,Chevron Corp.,stock,NYSE
+KO,Coca-Cola Co.,stock,NYSE
+PEP,PepsiCo Inc.,stock,NASDAQ
+DIS,Walt Disney Co.,stock,NYSE
+MCD,McDonald's Corp.,stock,NYSE
+CAT,Caterpillar Inc.,stock,NYSE
+BA,Boeing Co.,stock,NYSE
+GE,GE Aerospace,stock,NYSE
+PLTR,Palantir Technologies Inc.,stock,NASDAQ
+SPY,SPDR S&P 500 ETF Trust,etf,NYSEARCA
+QQQ,Invesco QQQ Trust,etf,NASDAQ
+IWM,iShares Russell 2000 ETF,etf,NYSEARCA
+DIA,SPDR Dow Jones Industrial Average ETF,etf,NYSEARCA
+VTI,Vanguard Total Stock Market ETF,etf,NYSEARCA
+VOO,Vanguard S&P 500 ETF,etf,NYSEARCA
+XLK,Technology Select Sector SPDR Fund,etf,NYSEARCA
+XLF,Financial Select Sector SPDR Fund,etf,NYSEARCA
+XLE,Energy Select Sector SPDR Fund,etf,NYSEARCA
+GLD,SPDR Gold Shares,etf,NYSEARCA
+TLT,iShares 20+ Year Treasury Bond ETF,etf,NASDAQ
+

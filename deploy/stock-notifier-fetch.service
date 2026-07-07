@@ -1,0 +1,16 @@
+[Unit]
+Description=Stock Notifier grouped daily fetch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=stocknotifier
+Group=stocknotifier
+WorkingDirectory=/opt/stock-notifier
+EnvironmentFile=/opt/stock-notifier/.env
+ExecStart=/opt/stock-notifier/.venv/bin/stock-notifier fetch-daily
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+

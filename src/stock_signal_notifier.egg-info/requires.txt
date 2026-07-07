@@ -1,0 +1,8 @@
+pandas<3,>=2.2
+python-dotenv<2,>=1.0
+requests<3,>=2.32
+streamlit<2,>=1.36
+
+[dev]
+pytest<9,>=8.2
+ruff<1,>=0.5

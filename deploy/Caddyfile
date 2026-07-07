@@ -1,0 +1,7 @@
+# Phase 1, IP-only access. Replace :80 with notifier.example.com after DNS points here;
+# Caddy will then obtain and renew HTTPS automatically.
+:80 {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8501
+}
+

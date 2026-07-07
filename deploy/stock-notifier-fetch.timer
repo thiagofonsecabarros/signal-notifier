@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Stock Notifier after the US market close
+
+[Timer]
+# 22:15 UTC is safely after the regular close in both EST and EDT.
+OnCalendar=Mon..Fri *-*-* 22:15:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+Unit=stock-notifier-fetch.service
+
+[Install]
+WantedBy=timers.target
+
