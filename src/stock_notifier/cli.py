@@ -8,6 +8,7 @@ from stock_notifier.config import Settings
 from stock_notifier.db import Database
 from stock_notifier.ingest import backfill_symbols, fetch_grouped_with_lookback
 from stock_notifier.providers.massive import MassiveClient
+from stock_notifier.scoring.service import score_enabled_signals, score_signal, seed_starter_signals
 from stock_notifier.symbols import load_symbols
 
 
@@ -25,6 +26,16 @@ def _parser() -> argparse.ArgumentParser:
     backfill.add_argument("--days", type=int, default=90)
     backfill.add_argument("--end", type=date.fromisoformat, default=date.today())
     backfill.add_argument("--symbols", help="Optional comma-separated subset")
+
+    subparsers.add_parser("seed-signals", help="Create or update starter signal definitions")
+    subparsers.add_parser("list-signals", help="List saved signal definitions")
+
+    score = subparsers.add_parser("score", help="Run one saved signal definition")
+    score.add_argument("--signal", required=True, help="Signal id or name")
+    score.add_argument("--symbols", help="Optional comma-separated subset")
+    score.add_argument("--no-store", action="store_true", help="Preview without saving scores")
+
+    subparsers.add_parser("score-all", help="Run every enabled saved signal definition")
     return parser
 
 
@@ -77,8 +88,34 @@ def main() -> None:
         print(f"Stored {written} bars; {errors} symbol errors")
         if errors:
             raise SystemExit(2)
+    elif args.command == "seed-signals":
+        count = seed_starter_signals(database)
+        print(f"Seeded {count} starter signals")
+    elif args.command == "list-signals":
+        definitions = database.list_signal_definitions()
+        if not definitions:
+            print("No saved signals. Run `stock-notifier seed-signals` first.")
+        for definition in definitions:
+            status = "enabled" if definition["enabled"] else "disabled"
+            print(f"{definition['id']}: {definition['name']} ({status})")
+    elif args.command == "score":
+        definition = database.get_signal_definition(args.signal)
+        if definition is None:
+            raise SystemExit(f"Unknown signal: {args.signal}")
+        requested_symbols = None
+        if args.symbols:
+            requested_symbols = {
+                item.strip().upper() for item in args.symbols.split(",") if item.strip()
+            }
+        results = score_signal(database, definition, requested_symbols, store=not args.no_store)
+        print(f"Scored {len(results)} symbols for {definition['name']}")
+        for item in results[:20]:
+            print(f"{item.symbol:8s} {item.score:6.2f} {'OK' if item.eligible else 'FILTERED'}")
+    elif args.command == "score-all":
+        results = score_enabled_signals(database)
+        total = sum(len(items) for items in results.values())
+        print(f"Scored {total} symbol/signal rows across {len(results)} signals")
 
 
 if __name__ == "__main__":
     main()
-

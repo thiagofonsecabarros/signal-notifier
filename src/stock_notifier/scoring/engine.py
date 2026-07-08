@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any
+
+import pandas as pd
+
+from stock_notifier.scoring.indicators import (
+    adx,
+    distance_pct,
+    ema,
+    price_change_pct,
+    scale_score,
+    sma,
+    volume_ratio,
+)
+
+
+@dataclass(frozen=True)
+class SignalDefinition:
+    name: str
+    config: dict[str, Any]
+    signal_id: int | None = None
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class ComponentResult:
+    name: str
+    component_type: str
+    mode: str
+    value: float | None
+    passed: bool
+    score: float
+    weight: float
+    contribution: float
+    message: str
+
+
+@dataclass(frozen=True)
+class ScoredSymbol:
+    symbol: str
+    signal_name: str
+    trading_date: str | None
+    close: float | None
+    score: float
+    eligible: bool
+    components: list[ComponentResult]
+    message: str
+
+
+def _as_float(value: Any) -> float | None:
+    if value in (None, "", "N/A"):
+        return None
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(candidate):
+        return None
+    return candidate
+
+
+def _operator_passes(value: float | None, operator: str, threshold: float | None) -> bool:
+    if value is None or threshold is None:
+        return False
+    if operator == ">":
+        return value > threshold
+    if operator == ">=":
+        return value >= threshold
+    if operator == "<":
+        return value < threshold
+    if operator == "<=":
+        return value <= threshold
+    if operator in {"=", "=="}:
+        return math.isclose(value, threshold)
+    raise ValueError(f"Unsupported operator: {operator}")
+
+
+def _latest(series: pd.Series, index: int) -> float | None:
+    if index < 0 or index >= len(series):
+        return None
+    return _as_float(series.iloc[index])
+
+
+def _indicator_value(frame: pd.DataFrame, component: dict[str, Any]) -> tuple[float | None, str]:
+    component_type = str(component.get("type") or "").strip()
+    params = dict(component.get("params") or {})
+    index = len(frame) - 1
+    if frame.empty or index < 0:
+        return None, "No price history"
+
+    close = frame["close"]
+    latest_close = _as_float(close.iloc[index])
+
+    if component_type in {"price_vs_sma", "ma_distance_pct"}:
+        period = int(params.get("period") or component.get("period") or 20)
+        ma_value = _latest(sma(close, period), index)
+        value = distance_pct(latest_close, ma_value)
+        return value, f"Close vs SMA{period}"
+
+    if component_type == "price_vs_ema":
+        period = int(params.get("period") or component.get("period") or 20)
+        ma_value = _latest(ema(close, period), index)
+        value = distance_pct(latest_close, ma_value)
+        return value, f"Close vs EMA{period}"
+
+    if component_type == "sma_crossover":
+        fast = int(params.get("fast_period") or component.get("fast_period") or 5)
+        slow = int(params.get("slow_period") or component.get("slow_period") or 20)
+        fast_value = _latest(sma(close, fast), index)
+        slow_value = _latest(sma(close, slow), index)
+        return distance_pct(fast_value, slow_value), f"SMA{fast} vs SMA{slow}"
+
+    if component_type == "ema_crossover":
+        fast = int(params.get("fast_period") or component.get("fast_period") or 5)
+        slow = int(params.get("slow_period") or component.get("slow_period") or 20)
+        fast_value = _latest(ema(close, fast), index)
+        slow_value = _latest(ema(close, slow), index)
+        return distance_pct(fast_value, slow_value), f"EMA{fast} vs EMA{slow}"
+
+    if component_type == "adx":
+        period = int(params.get("period") or component.get("period") or 14)
+        value = _latest(adx(frame["high"], frame["low"], close, period), index)
+        return value, f"ADX{period}"
+
+    if component_type == "volume_ratio":
+        period = int(params.get("period") or component.get("period") or 20)
+        value = _latest(volume_ratio(frame["volume"], period), index)
+        return value, f"Volume / {period}-day average"
+
+    if component_type == "price_change_pct":
+        days = int(params.get("days") or component.get("days") or 5)
+        value = _latest(price_change_pct(close, days), index)
+        return value, f"{days}-day price change %"
+
+    raise ValueError(f"Unsupported component type: {component_type}")
+
+
+def _component_result(frame: pd.DataFrame, component: dict[str, Any]) -> ComponentResult:
+    component_type = str(component.get("type") or "").strip()
+    mode = str(component.get("mode") or "score").strip().lower()
+    if mode not in {"score", "gate"}:
+        raise ValueError(f"Unsupported component mode: {mode}")
+    name = str(component.get("name") or component_type or "Component")
+    value, label = _indicator_value(frame, component)
+
+    operator = str(component.get("operator") or ">=").strip()
+    threshold = _as_float(component.get("threshold"))
+    passed = _operator_passes(value, operator, threshold) if threshold is not None else value is not None
+
+    weight = _as_float(component.get("weight")) or 0.0
+    if mode == "gate":
+        score = 100.0 if passed else 0.0
+        contribution = 0.0
+    else:
+        score_min = _as_float(component.get("score_min"))
+        score_max = _as_float(component.get("score_max"))
+        if score_min is None:
+            score_min = threshold if threshold is not None else 0.0
+        if score_max is None:
+            score_max = score_min + 10.0
+        score = scale_score(
+            value,
+            low=score_min,
+            high=score_max,
+            direction=str(component.get("direction") or "higher"),
+        )
+        contribution = score * weight
+
+    if value is None:
+        message = f"{label}: insufficient data"
+    elif threshold is None:
+        message = f"{label}: {value:.2f}"
+    else:
+        message = f"{label}: {value:.2f} {operator} {threshold:g} = {'yes' if passed else 'no'}"
+
+    return ComponentResult(
+        name=name,
+        component_type=component_type,
+        mode=mode,
+        value=value,
+        passed=passed,
+        score=round(score, 4),
+        weight=round(weight, 4),
+        contribution=round(contribution, 4),
+        message=message,
+    )
+
+
+def evaluate_signal(
+    definition: SignalDefinition,
+    history_by_symbol: dict[str, pd.DataFrame],
+) -> list[ScoredSymbol]:
+    config = dict(definition.config or {})
+    components = list(config.get("components") or [])
+    if not components:
+        raise ValueError(f"Signal '{definition.name}' has no components")
+
+    results: list[ScoredSymbol] = []
+    for symbol, frame in sorted(history_by_symbol.items()):
+        prepared = frame.sort_values("trading_date").reset_index(drop=True).copy()
+        component_results = [_component_result(prepared, component) for component in components]
+        failed_gates = [
+            component for component in component_results if component.mode == "gate" and not component.passed
+        ]
+        score_components = [component for component in component_results if component.mode == "score"]
+        weight_sum = sum(component.weight for component in score_components if component.weight > 0)
+        raw_score = (
+            sum(component.contribution for component in score_components) / weight_sum
+            if weight_sum > 0
+            else 0.0
+        )
+        eligible = not failed_gates
+        score = raw_score if eligible else 0.0
+        latest = prepared.iloc[-1] if not prepared.empty else {}
+        message = "OK" if eligible else "Failed gates: " + ", ".join(component.name for component in failed_gates)
+        if not score_components:
+            message = f"{message}; no weighted components"
+        results.append(
+            ScoredSymbol(
+                symbol=symbol,
+                signal_name=definition.name,
+                trading_date=str(latest.get("trading_date")) if len(prepared) else None,
+                close=_as_float(latest.get("close")) if len(prepared) else None,
+                score=round(score, 2),
+                eligible=eligible,
+                components=component_results,
+                message=message,
+            )
+        )
+
+    results.sort(key=lambda item: (item.eligible, item.score), reverse=True)
+    return results
