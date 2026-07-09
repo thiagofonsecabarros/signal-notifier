@@ -7,6 +7,11 @@ from typing import Any
 from stock_notifier.config import Settings
 from stock_notifier.db import Database
 from stock_notifier.notifications.formatter import format_alert_message, format_test_message
+from stock_notifier.notifications.schedule import (
+    is_schedule_due,
+    parse_datetime as parse_scheduled_datetime,
+    parse_schedule,
+)
 from stock_notifier.notifications.telegram import TelegramClient
 
 
@@ -17,19 +22,12 @@ class AlertScanResult:
     deliveries_attempted: int
     delivered: int
     dry_run: bool
+    queued: int = 0
+    dropped: int = 0
 
 
 def _parse_datetime(value: Any) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    return parse_scheduled_datetime(value)
 
 
 def _cooldown_elapsed(state: dict[str, Any] | None, cooldown_hours: float) -> bool:
@@ -49,9 +47,8 @@ def _should_trigger(
     state: dict[str, Any] | None,
     cooldown_hours: float,
 ) -> bool:
+    _ = cooldown_hours  # retained for compatibility with older alert-rule rows
     previous_score = state.get("last_score") if state else None
-    if not _cooldown_elapsed(state, cooldown_hours):
-        return False
     if direction == "BUY":
         crossed = previous_score is None or float(previous_score) < threshold
         return crossed and score >= threshold
@@ -68,6 +65,11 @@ def seed_alert_rules(database: Database, settings: Settings) -> int:
         buy_threshold=settings.alert_default_buy_threshold,
         sell_threshold=settings.alert_default_sell_threshold,
         cooldown_hours=settings.alert_cooldown_hours,
+        frequency_amount=settings.alert_default_frequency_amount,
+        frequency_unit=settings.alert_default_frequency_unit,
+        start_time=settings.alert_default_start_time,
+        timezone=settings.alert_default_timezone,
+        market_hours_only=settings.alert_default_market_hours_only,
     )
 
 
@@ -112,11 +114,134 @@ def _deliver_alert(
     return result.ok
 
 
+def _threshold_satisfied(direction: str, score: float, threshold: float) -> bool:
+    if direction == "BUY":
+        return score >= threshold
+    if direction == "SELL":
+        return score <= threshold
+    raise ValueError(f"Unsupported alert direction: {direction}")
+
+
+def _create_and_deliver_alert(
+    database: Database,
+    settings: Settings,
+    *,
+    score_row: dict[str, Any],
+    direction: str,
+    threshold: float,
+    message: str,
+    dry_run: bool,
+) -> tuple[int, bool]:
+    alert_id = database.create_alert(
+        alert_rule_id=int(score_row["alert_rule_id"]),
+        signal_id=score_row.get("signal_id"),
+        signal_name=str(score_row["signal_name"]),
+        symbol=str(score_row["symbol"]),
+        direction=direction,
+        score=float(score_row["score"]),
+        threshold=threshold,
+        trading_date=score_row.get("trading_date"),
+        close=score_row.get("close"),
+        message=message,
+    )
+    alert = {
+        **score_row,
+        "id": alert_id,
+        "direction": direction,
+        "threshold": threshold,
+        "message": message,
+    }
+    components = (
+        database.score_components_for_score(int(score_row["score_id"]))
+        if score_row.get("score_id") is not None
+        else []
+    )
+    delivered = _deliver_alert(
+        database,
+        settings,
+        alert_id=alert_id,
+        alert=alert,
+        components=components,
+        dry_run=dry_run,
+    )
+    return alert_id, delivered
+
+
+def _process_pending_alerts(
+    database: Database,
+    settings: Settings,
+    *,
+    now: datetime,
+    dry_run: bool,
+) -> tuple[int, int, int, int]:
+    alerts_created = 0
+    deliveries_attempted = 0
+    delivered = 0
+    dropped = 0
+
+    for pending in database.pending_alerts_for_rules():
+        direction = str(pending["direction"])
+        latest_score = pending.get("latest_score")
+        if latest_score is None or not int(pending.get("latest_eligible") or 0):
+            database.update_pending_alert_status(int(pending["id"]), "dropped")
+            dropped += 1
+            continue
+
+        threshold = float(pending["buy_threshold"] if direction == "BUY" else pending["sell_threshold"])
+        score = float(latest_score)
+        if not _threshold_satisfied(direction, score, threshold):
+            database.update_pending_alert_status(int(pending["id"]), "dropped")
+            dropped += 1
+            continue
+
+        schedule = parse_schedule(pending)
+        state = database.get_alert_state(str(pending["signal_name"]), str(pending["symbol"]), direction)
+        if not is_schedule_due(
+            now=now,
+            schedule=schedule,
+            last_alerted_at=state.get("last_alerted_at") if state else None,
+        ):
+            continue
+
+        score_row = {
+            **pending,
+            "score_id": pending.get("latest_score_id") or pending.get("score_id"),
+            "score": score,
+            "trading_date": pending.get("latest_trading_date") or pending.get("trading_date"),
+            "close": pending.get("latest_close") or pending.get("close"),
+        }
+        message = f"{direction} queued threshold confirmed: {score:.2f} vs {threshold:.2f}"
+        alert_id, sent = _create_and_deliver_alert(
+            database,
+            settings,
+            score_row=score_row,
+            direction=direction,
+            threshold=threshold,
+            message=message,
+            dry_run=dry_run,
+        )
+        database.update_pending_alert_status(int(pending["id"]), "sent")
+        database.upsert_alert_state(
+            signal_name=str(pending["signal_name"]),
+            symbol=str(pending["symbol"]),
+            direction=direction,
+            last_score=score,
+            last_alerted_at=now.isoformat(),
+            last_alert_id=alert_id,
+        )
+        alerts_created += 1
+        deliveries_attempted += 1
+        delivered += 1 if sent else 0
+
+    return alerts_created, deliveries_attempted, delivered, dropped
+
+
 def scan_alerts(
     database: Database,
     settings: Settings,
     *,
     dry_run: bool | None = None,
+    now: datetime | None = None,
 ) -> AlertScanResult:
     effective_dry_run = settings.alert_dry_run if dry_run is None else dry_run
     database.upsert_notification_channel(
@@ -130,7 +255,21 @@ def scan_alerts(
     alerts_created = 0
     deliveries_attempted = 0
     delivered = 0
-    now = datetime.now(UTC).isoformat()
+    queued = 0
+    dropped = 0
+    scan_time = (now or datetime.now(UTC)).astimezone(UTC)
+    now_text = scan_time.isoformat()
+
+    pending_counts = _process_pending_alerts(
+        database,
+        settings,
+        now=scan_time,
+        dry_run=effective_dry_run,
+    )
+    alerts_created += pending_counts[0]
+    deliveries_attempted += pending_counts[1]
+    delivered += pending_counts[2]
+    dropped += pending_counts[3]
 
     for score_row in database.latest_scores_for_alert_rules():
         evaluated += 1
@@ -165,45 +304,54 @@ def scan_alerts(
                 continue
 
             message = f"{direction} threshold crossed: {score:.2f} vs {threshold:.2f}"
-            alert_id = database.create_alert(
-                alert_rule_id=int(score_row["alert_rule_id"]),
-                signal_id=score_row.get("signal_id"),
-                signal_name=signal_name,
-                symbol=symbol,
+            schedule = parse_schedule(score_row)
+            if not is_schedule_due(
+                now=scan_time,
+                schedule=schedule,
+                last_alerted_at=state.get("last_alerted_at") if state else None,
+            ):
+                database.upsert_pending_alert(
+                    alert_rule_id=int(score_row["alert_rule_id"]),
+                    signal_id=score_row.get("signal_id"),
+                    signal_name=signal_name,
+                    symbol=symbol,
+                    direction=direction,
+                    score=score,
+                    threshold=threshold,
+                    trading_date=score_row.get("trading_date"),
+                    close=score_row.get("close"),
+                    score_id=int(score_row["score_id"]),
+                    message=message,
+                )
+                database.upsert_alert_state(
+                    signal_name=signal_name,
+                    symbol=symbol,
+                    direction=direction,
+                    last_score=score,
+                )
+                queued += 1
+                continue
+
+            alert_id, sent = _create_and_deliver_alert(
+                database,
+                settings,
+                score_row=score_row,
                 direction=direction,
-                score=score,
                 threshold=threshold,
-                trading_date=score_row.get("trading_date"),
-                close=score_row.get("close"),
                 message=message,
+                dry_run=effective_dry_run,
             )
             alerts_created += 1
+            deliveries_attempted += 1
+            delivered += 1 if sent else 0
             database.upsert_alert_state(
                 signal_name=signal_name,
                 symbol=symbol,
                 direction=direction,
                 last_score=score,
-                last_alerted_at=now,
+                last_alerted_at=now_text,
                 last_alert_id=alert_id,
             )
-            alert = {
-                **score_row,
-                "id": alert_id,
-                "direction": direction,
-                "threshold": threshold,
-                "message": message,
-            }
-            components = database.score_components_for_score(int(score_row["score_id"]))
-            deliveries_attempted += 1
-            if _deliver_alert(
-                database,
-                settings,
-                alert_id=alert_id,
-                alert=alert,
-                components=components,
-                dry_run=effective_dry_run,
-            ):
-                delivered += 1
 
     return AlertScanResult(
         evaluated=evaluated,
@@ -211,6 +359,8 @@ def scan_alerts(
         deliveries_attempted=deliveries_attempted,
         delivered=delivered,
         dry_run=effective_dry_run,
+        queued=queued,
+        dropped=dropped,
     )
 
 

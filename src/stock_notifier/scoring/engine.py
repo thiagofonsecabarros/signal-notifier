@@ -130,6 +130,15 @@ def _indicator_value(frame: pd.DataFrame, component: dict[str, Any]) -> tuple[fl
         value = _latest(volume_ratio(frame["volume"], period), index)
         return value, f"Volume / {period}-day average"
 
+    if component_type == "latest_volume":
+        value = _as_float(frame["volume"].iloc[index])
+        return value, "Latest volume"
+
+    if component_type == "dollar_volume":
+        latest_volume = _as_float(frame["volume"].iloc[index])
+        value = latest_close * latest_volume if latest_close is not None and latest_volume is not None else None
+        return value, "Dollar volume"
+
     if component_type == "price_change_pct":
         days = int(params.get("days") or component.get("days") or 5)
         value = _latest(price_change_pct(close, days), index)
@@ -152,7 +161,11 @@ def _component_result(frame: pd.DataFrame, component: dict[str, Any]) -> Compone
 
     weight = _as_float(component.get("weight")) or 0.0
     if mode == "gate":
-        score = 100.0 if passed else 0.0
+        # Gates are filters, not ranking inputs. Keep score/weight/contribution
+        # at zero so component breakdowns cannot be mistaken for weighted score
+        # components.
+        score = 0.0
+        weight = 0.0
         contribution = 0.0
     else:
         score_min = _as_float(component.get("score_min"))

@@ -12,6 +12,7 @@ from stock_notifier.notifications.service import (
     seed_alert_rules,
     send_telegram_test,
 )
+from stock_notifier.pipeline import run_scan_cycle, scan_cycle_lock
 from stock_notifier.providers.massive import MassiveClient
 from stock_notifier.scoring.service import score_enabled_signals, score_signal, seed_starter_signals
 from stock_notifier.symbols import load_symbols
@@ -22,6 +23,15 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init-db", help="Create or upgrade the SQLite schema")
     subparsers.add_parser("sync-symbols", help="Upsert config/symbols.txt into SQLite")
+
+    profiles = subparsers.add_parser("sync-profiles", help="Fetch Massive ticker overview metadata")
+    profiles.add_argument("--symbols", help="Optional comma-separated subset")
+    profiles.add_argument("--limit", type=int, default=100, help="Maximum missing profiles to fetch")
+    profiles.add_argument(
+        "--requests-per-minute",
+        type=int,
+        help="Override profile-sync request rate. Defaults to MASSIVE_PROFILE_REQUESTS_PER_MINUTE.",
+    )
 
     daily = subparsers.add_parser("fetch-daily", help="Fetch the most recent grouped daily bars")
     daily.add_argument("--date", type=date.fromisoformat, default=date.today())
@@ -53,6 +63,13 @@ def _parser() -> argparse.ArgumentParser:
 
     alerts_history = subparsers.add_parser("alerts-history", help="Show recent generated alerts")
     alerts_history.add_argument("--limit", type=int, default=20)
+
+    scan_cycle = subparsers.add_parser("run-scan-cycle", help="Fetch snapshot, score filtered symbols, scan alerts")
+    scan_cycle.add_argument("--dry-run", action="store_true", help="Record deliveries without sending")
+    scan_cycle.add_argument("--max-symbols", type=int, help="Maximum filtered symbols to score")
+    scan_cycle.add_argument("--symbols", help="Optional comma-separated subset")
+    scan_cycle.add_argument("--skip-telegram", action="store_true", help="Do not send Telegram messages")
+    scan_cycle.add_argument("--benchmark", action="store_true", help="Print timing and volume details")
     return parser
 
 
@@ -65,9 +82,18 @@ def _provider(settings: Settings) -> MassiveClient:
     )
 
 
+def _profile_provider(settings: Settings, requests_per_minute: int | None = None) -> MassiveClient:
+    return MassiveClient(
+        settings.massive_api_key,
+        base_url=settings.massive_base_url,
+        requests_per_minute=requests_per_minute or settings.profile_requests_per_minute,
+        timeout_seconds=settings.http_timeout_seconds,
+    )
+
+
 def main() -> None:
     args = _parser().parse_args()
-    require_api_key = args.command in {"fetch-daily", "backfill"}
+    require_api_key = args.command in {"fetch-daily", "backfill", "run-scan-cycle", "sync-profiles"}
     settings = Settings.from_env(require_api_key=require_api_key)
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
@@ -84,6 +110,37 @@ def main() -> None:
         print(f"Initialized {settings.db_path}")
     elif args.command == "sync-symbols":
         print(f"Synchronized {len(symbols)} symbols")
+    elif args.command == "sync-profiles":
+        if args.symbols:
+            profile_symbols = [
+                item.strip().upper() for item in args.symbols.split(",") if item.strip()
+            ]
+        else:
+            profile_symbols = database.symbols_missing_profiles(limit=args.limit)
+        provider = _profile_provider(settings, args.requests_per_minute)
+        fetched = 0
+        missing = 0
+        errors = 0
+        for symbol in profile_symbols:
+            try:
+                profile = provider.ticker_overview(symbol)
+                if profile is None:
+                    missing += 1
+                    database.mark_company_profile_unavailable(symbol)
+                    continue
+                database.ensure_symbols([profile.ticker])
+                database.upsert_company_profile(profile)
+                fetched += 1
+            except Exception as exc:
+                errors += 1
+                logging.exception("Profile sync failed for %s", symbol)
+                print(f"{symbol}: {exc}")
+        print(
+            f"Synchronized {fetched} company profiles; "
+            f"unavailable={missing}, errors={errors}, total_profiles={database.count_company_profiles()}"
+        )
+        if errors:
+            raise SystemExit(2)
     elif args.command == "fetch-daily":
         actual_date, count = fetch_grouped_with_lookback(
             database,
@@ -161,6 +218,36 @@ def main() -> None:
                 f"{alert['id']}: {alert['created_at']} {alert['direction']} "
                 f"{alert['symbol']} {alert['signal_name']} score={alert['score']:.2f}"
             )
+    elif args.command == "run-scan-cycle":
+        requested_symbols = None
+        if args.symbols:
+            requested_symbols = {
+                item.strip().upper() for item in args.symbols.split(",") if item.strip()
+            }
+        try:
+            with scan_cycle_lock(settings.scan_lock_path):
+                result = run_scan_cycle(
+                    database,
+                    _provider(settings),
+                    settings,
+                    dry_run=True if args.dry_run else None,
+                    max_symbols=args.max_symbols,
+                    symbols=requested_symbols,
+                    skip_telegram=args.skip_telegram,
+                    benchmark=args.benchmark,
+                )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(
+            "Scan cycle complete: "
+            f"snapshots={result.snapshots_fetched}, filtered={result.symbols_filtered}, "
+            f"scored={result.symbols_scored}, alerts={result.alerts.alerts_created}, "
+            f"queued={result.alerts.queued}, deliveries={result.alerts.deliveries_attempted}, "
+            f"delivered={result.alerts.delivered}, dry_run={result.dry_run}, "
+            f"duration={result.duration_seconds:.2f}s"
+        )
+        if result.message:
+            print(result.message)
 
 
 if __name__ == "__main__":

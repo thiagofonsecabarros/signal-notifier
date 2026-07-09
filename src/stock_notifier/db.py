@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from stock_notifier.models import DailyBar, Symbol
+from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot, Symbol
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS symbols (
@@ -35,6 +35,55 @@ CREATE TABLE IF NOT EXISTS daily_bars (
 );
 
 CREATE INDEX IF NOT EXISTS idx_daily_bars_date ON daily_bars(trading_date);
+
+CREATE TABLE IF NOT EXISTS company_profiles (
+    ticker TEXT PRIMARY KEY REFERENCES symbols(ticker),
+    name TEXT NOT NULL DEFAULT '',
+    market TEXT NOT NULL DEFAULT '',
+    locale TEXT NOT NULL DEFAULT '',
+    primary_exchange TEXT NOT NULL DEFAULT '',
+    type TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    currency_name TEXT NOT NULL DEFAULT '',
+    cik TEXT NOT NULL DEFAULT '',
+    composite_figi TEXT NOT NULL DEFAULT '',
+    share_class_figi TEXT NOT NULL DEFAULT '',
+    sic_code TEXT NOT NULL DEFAULT '',
+    sic_description TEXT NOT NULL DEFAULT '',
+    market_cap REAL,
+    weighted_shares_outstanding REAL,
+    total_employees INTEGER,
+    homepage_url TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    list_date TEXT NOT NULL DEFAULT '',
+    logo_url TEXT NOT NULL DEFAULT '',
+    icon_url TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_company_profiles_sic
+ON company_profiles(sic_description, sic_code);
+
+CREATE INDEX IF NOT EXISTS idx_company_profiles_market_cap
+ON company_profiles(market_cap DESC);
+
+CREATE TABLE IF NOT EXISTS symbol_lists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS symbol_list_members (
+    list_id INTEGER NOT NULL REFERENCES symbol_lists(id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL REFERENCES symbols(ticker) ON DELETE CASCADE,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (list_id, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_list_members_symbol
+ON symbol_list_members(symbol);
 
 CREATE TABLE IF NOT EXISTS fetch_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,6 +171,11 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     buy_threshold REAL NOT NULL DEFAULT 75,
     sell_threshold REAL NOT NULL DEFAULT 40,
     cooldown_hours REAL NOT NULL DEFAULT 12,
+    frequency_amount INTEGER NOT NULL DEFAULT 15,
+    frequency_unit TEXT NOT NULL DEFAULT 'minutes',
+    start_time TEXT NOT NULL DEFAULT '09:45',
+    timezone TEXT NOT NULL DEFAULT 'America/Toronto',
+    market_hours_only INTEGER NOT NULL DEFAULT 1 CHECK (market_hours_only IN (0, 1)),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -164,6 +218,62 @@ CREATE TABLE IF NOT EXISTS alert_state (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (signal_name, symbol, direction)
 );
+
+CREATE TABLE IF NOT EXISTS pending_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_rule_id INTEGER REFERENCES alert_rules(id),
+    signal_id INTEGER REFERENCES signal_definitions(id),
+    signal_name TEXT NOT NULL,
+    symbol TEXT NOT NULL REFERENCES symbols(ticker),
+    direction TEXT NOT NULL CHECK (direction IN ('BUY', 'SELL')),
+    score REAL NOT NULL,
+    threshold REAL NOT NULL,
+    trading_date TEXT,
+    close REAL,
+    score_id INTEGER REFERENCES signal_scores(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'dropped')),
+    message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_alerts_status ON pending_alerts(status, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_alerts_open
+ON pending_alerts(signal_name, symbol, direction)
+WHERE status='pending';
+
+CREATE TABLE IF NOT EXISTS market_snapshots (
+    symbol TEXT PRIMARY KEY REFERENCES symbols(ticker),
+    snapshot_at TEXT NOT NULL,
+    price REAL NOT NULL,
+    day_open REAL,
+    day_high REAL,
+    day_low REAL,
+    day_close REAL,
+    day_volume REAL,
+    previous_close REAL,
+    percent_change REAL,
+    minute_volume REAL,
+    fetched_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_snapshots_volume
+ON market_snapshots(day_volume DESC, price DESC);
+
+CREATE TABLE IF NOT EXISTS scan_cycle_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL CHECK (status IN ('running', 'success', 'partial', 'failed', 'skipped')),
+    snapshots_fetched INTEGER NOT NULL DEFAULT 0,
+    symbols_filtered INTEGER NOT NULL DEFAULT 0,
+    symbols_scored INTEGER NOT NULL DEFAULT 0,
+    alerts_created INTEGER NOT NULL DEFAULT 0,
+    deliveries_attempted INTEGER NOT NULL DEFAULT 0,
+    delivered INTEGER NOT NULL DEFAULT 0,
+    duration_seconds REAL NOT NULL DEFAULT 0,
+    message TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -190,6 +300,24 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+
+    @staticmethod
+    def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+        return {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        alert_rule_columns = self._columns(connection, "alert_rules")
+        alert_rule_additions = {
+            "frequency_amount": "INTEGER NOT NULL DEFAULT 15",
+            "frequency_unit": "TEXT NOT NULL DEFAULT 'minutes'",
+            "start_time": "TEXT NOT NULL DEFAULT '09:45'",
+            "timezone": "TEXT NOT NULL DEFAULT 'America/Toronto'",
+            "market_hours_only": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for column, definition in alert_rule_additions.items():
+            if column not in alert_rule_columns:
+                connection.execute(f"ALTER TABLE alert_rules ADD COLUMN {column} {definition}")
 
     def sync_symbols(self, symbols: Iterable[Symbol]) -> int:
         now = datetime.now(UTC).isoformat()
@@ -202,6 +330,21 @@ class Database:
                 ON CONFLICT(ticker) DO UPDATE SET
                     name=excluded.name, exchange=excluded.exchange,
                     asset_type=excluded.asset_type, active=1, updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def ensure_symbols(self, tickers: Iterable[str]) -> int:
+        now = datetime.now(UTC).isoformat()
+        rows = [(ticker.upper().strip(), now) for ticker in tickers if ticker.strip()]
+        if not rows:
+            return 0
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO symbols(ticker, updated_at)
+                VALUES (?, ?)
                 """,
                 rows,
             )
@@ -375,11 +518,290 @@ class Database:
                 ),
             )
 
+    def upsert_market_snapshots(self, snapshots: Iterable[MarketSnapshot]) -> int:
+        now = datetime.now(UTC).isoformat()
+        rows = [
+            (
+                snapshot.symbol,
+                snapshot.snapshot_at.isoformat(),
+                snapshot.price,
+                snapshot.day_open,
+                snapshot.day_high,
+                snapshot.day_low,
+                snapshot.day_close,
+                snapshot.day_volume,
+                snapshot.previous_close,
+                snapshot.percent_change,
+                snapshot.minute_volume,
+                now,
+            )
+            for snapshot in snapshots
+        ]
+        if not rows:
+            return 0
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO market_snapshots(
+                    symbol, snapshot_at, price, day_open, day_high, day_low,
+                    day_close, day_volume, previous_close, percent_change,
+                    minute_volume, fetched_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    snapshot_at=excluded.snapshot_at,
+                    price=excluded.price,
+                    day_open=excluded.day_open,
+                    day_high=excluded.day_high,
+                    day_low=excluded.day_low,
+                    day_close=excluded.day_close,
+                    day_volume=excluded.day_volume,
+                    previous_close=excluded.previous_close,
+                    percent_change=excluded.percent_change,
+                    minute_volume=excluded.minute_volume,
+                    fetched_at=excluded.fetched_at
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def upsert_company_profile(self, profile: CompanyProfile) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO company_profiles(
+                    ticker, name, market, locale, primary_exchange, type, active,
+                    currency_name, cik, composite_figi, share_class_figi,
+                    sic_code, sic_description, market_cap,
+                    weighted_shares_outstanding, total_employees, homepage_url,
+                    description, list_date, logo_url, icon_url, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker) DO UPDATE SET
+                    name=excluded.name,
+                    market=excluded.market,
+                    locale=excluded.locale,
+                    primary_exchange=excluded.primary_exchange,
+                    type=excluded.type,
+                    active=excluded.active,
+                    currency_name=excluded.currency_name,
+                    cik=excluded.cik,
+                    composite_figi=excluded.composite_figi,
+                    share_class_figi=excluded.share_class_figi,
+                    sic_code=excluded.sic_code,
+                    sic_description=excluded.sic_description,
+                    market_cap=excluded.market_cap,
+                    weighted_shares_outstanding=excluded.weighted_shares_outstanding,
+                    total_employees=excluded.total_employees,
+                    homepage_url=excluded.homepage_url,
+                    description=excluded.description,
+                    list_date=excluded.list_date,
+                    logo_url=excluded.logo_url,
+                    icon_url=excluded.icon_url,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    profile.ticker,
+                    profile.name,
+                    profile.market,
+                    profile.locale,
+                    profile.primary_exchange,
+                    profile.type,
+                    1 if profile.active else 0,
+                    profile.currency_name,
+                    profile.cik,
+                    profile.composite_figi,
+                    profile.share_class_figi,
+                    profile.sic_code,
+                    profile.sic_description,
+                    profile.market_cap,
+                    profile.weighted_shares_outstanding,
+                    profile.total_employees,
+                    profile.homepage_url,
+                    profile.description[:10000],
+                    profile.list_date,
+                    profile.logo_url,
+                    profile.icon_url,
+                    now,
+                ),
+            )
+
+    def mark_company_profile_unavailable(self, ticker: str, reason: str = "Ticker overview not found") -> None:
+        symbol = ticker.upper().strip()
+        if not symbol:
+            return
+        self.ensure_symbols([symbol])
+        self.upsert_company_profile(
+            CompanyProfile(
+                ticker=symbol,
+                name=symbol,
+                active=False,
+                type="unavailable",
+                description=reason,
+            )
+        )
+
+    def symbols_missing_profiles(self, *, limit: int = 100) -> list[str]:
+        rows = self.query(
+            """
+            SELECT s.ticker
+            FROM symbols s
+            LEFT JOIN company_profiles p ON p.ticker=s.ticker
+            WHERE s.active=1 AND p.ticker IS NULL
+            ORDER BY s.ticker
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [str(row["ticker"]) for row in rows]
+
+    def count_company_profiles(self) -> int:
+        rows = self.query("SELECT COUNT(*) AS count FROM company_profiles")
+        return int(rows[0]["count"]) if rows else 0
+
+    def create_symbol_list(self, name: str, description: str = "") -> int:
+        list_name = name.strip()
+        if not list_name:
+            raise ValueError("List name is required")
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO symbol_lists(name, description, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    description=COALESCE(NULLIF(excluded.description, ''), symbol_lists.description),
+                    updated_at=excluded.updated_at
+                RETURNING id
+                """,
+                (list_name, description.strip(), now, now),
+            )
+            return int(cursor.fetchone()[0])
+
+    def update_symbol_list(self, list_id: int, *, name: str, description: str = "") -> None:
+        list_name = name.strip()
+        if not list_name:
+            raise ValueError("List name is required")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE symbol_lists
+                SET name=?, description=?, updated_at=?
+                WHERE id=?
+                """,
+                (list_name, description.strip(), datetime.now(UTC).isoformat(), list_id),
+            )
+
+    def list_symbol_lists(self) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT l.id, l.name, l.description, COUNT(m.symbol) AS symbol_count,
+                   l.created_at, l.updated_at
+            FROM symbol_lists l
+            LEFT JOIN symbol_list_members m ON m.list_id=l.id
+            GROUP BY l.id
+            ORDER BY l.name
+            """
+        )
+        return [dict(row) for row in rows]
+
+    def delete_symbol_list(self, list_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM symbol_lists WHERE id=?", (list_id,))
+
+    def add_symbols_to_list(self, list_id: int, symbols: Iterable[str]) -> int:
+        requested = sorted({symbol.upper().strip() for symbol in symbols if symbol.strip()})
+        if not requested:
+            return 0
+        self.ensure_symbols(requested)
+        now = datetime.now(UTC).isoformat()
+        rows = [(list_id, symbol, now) for symbol in requested]
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO symbol_list_members(list_id, symbol, added_at)
+                VALUES (?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def remove_symbol_from_list(self, list_id: int, symbol: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM symbol_list_members WHERE list_id=? AND symbol=?",
+                (list_id, symbol.upper().strip()),
+            )
+
+    def symbols_in_list(self, list_id: int) -> list[str]:
+        rows = self.query(
+            """
+            SELECT symbol
+            FROM symbol_list_members
+            WHERE list_id=?
+            ORDER BY symbol
+            """,
+            (list_id,),
+        )
+        return [str(row["symbol"]) for row in rows]
+
+    def symbols_for_list_names(self, list_names: Iterable[str]) -> set[str]:
+        names = sorted({name.strip() for name in list_names if name.strip()})
+        if not names:
+            return set()
+        placeholders = ", ".join("?" for _ in names)
+        rows = self.query(
+            f"""
+            SELECT DISTINCT m.symbol
+            FROM symbol_lists l
+            JOIN symbol_list_members m ON m.list_id=l.id
+            WHERE l.name IN ({placeholders})
+            """,
+            tuple(names),
+        )
+        return {str(row["symbol"]) for row in rows}
+
+    def filtered_snapshot_symbols(
+        self,
+        *,
+        min_price: float,
+        min_day_volume: float,
+        max_symbols: int,
+        symbols: Iterable[str] | None = None,
+    ) -> list[str]:
+        parameters: list[Any] = [min_price, min_day_volume]
+        symbol_clause = ""
+        if symbols:
+            requested = sorted({symbol.upper() for symbol in symbols})
+            if requested:
+                placeholders = ", ".join("?" for _ in requested)
+                symbol_clause = f" AND s.ticker IN ({placeholders})"
+                parameters.extend(requested)
+        parameters.append(max_symbols)
+        rows = self.query(
+            f"""
+            SELECT s.ticker
+            FROM symbols s
+            JOIN market_snapshots m ON m.symbol=s.ticker
+            WHERE s.active=1
+              AND lower(s.asset_type) IN ('stock', 'common_stock', 'common stock', '')
+              AND m.price >= ?
+              AND COALESCE(m.day_volume, 0) >= ?
+              {symbol_clause}
+            ORDER BY (m.price * COALESCE(m.day_volume, 0)) DESC, m.day_volume DESC
+            LIMIT ?
+            """,
+            tuple(parameters),
+        )
+        return [str(row["ticker"]) for row in rows]
+
     def load_price_history(
         self,
         symbols: Iterable[str],
         *,
         min_bars: int = 260,
+        include_latest_snapshot: bool = False,
     ) -> dict[str, list[sqlite3.Row]]:
         requested = sorted({symbol.upper() for symbol in symbols})
         if not requested:
@@ -397,6 +819,22 @@ class Database:
         grouped: dict[str, list[sqlite3.Row]] = {symbol: [] for symbol in requested}
         for row in rows:
             grouped[str(row["symbol"])].append(row)
+        if include_latest_snapshot:
+            snapshot_rows = self.query(
+                f"""
+                SELECT symbol, snapshot_at AS trading_date,
+                       COALESCE(day_open, price) AS open,
+                       COALESCE(day_high, price) AS high,
+                       COALESCE(day_low, price) AS low,
+                       price AS close,
+                       COALESCE(day_volume, 0) AS volume
+                FROM market_snapshots
+                WHERE symbol IN ({placeholders})
+                """,
+                tuple(requested),
+            )
+            for row in snapshot_rows:
+                grouped[str(row["symbol"])].append(row)
         return {symbol: values[-min_bars:] for symbol, values in grouped.items() if values}
 
     def active_symbols(self) -> list[str]:
@@ -508,6 +946,11 @@ class Database:
         buy_threshold: float,
         sell_threshold: float,
         cooldown_hours: float,
+        frequency_amount: int = 15,
+        frequency_unit: str = "minutes",
+        start_time: str = "09:45",
+        timezone: str = "America/Toronto",
+        market_hours_only: bool = True,
     ) -> int:
         now = datetime.now(UTC).isoformat()
         definitions = self.list_signal_definitions(enabled_only=True)
@@ -517,9 +960,10 @@ class Database:
                     """
                     INSERT INTO alert_rules(
                         signal_id, signal_name, enabled, buy_threshold, sell_threshold,
-                        cooldown_hours, created_at, updated_at
+                        cooldown_hours, frequency_amount, frequency_unit, start_time,
+                        timezone, market_hours_only, created_at, updated_at
                     )
-                    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(signal_name) DO UPDATE SET
                         signal_id=excluded.signal_id,
                         updated_at=excluded.updated_at
@@ -530,6 +974,11 @@ class Database:
                         buy_threshold,
                         sell_threshold,
                         cooldown_hours,
+                        frequency_amount,
+                        frequency_unit,
+                        start_time,
+                        timezone,
+                        1 if market_hours_only else 0,
                         now,
                         now,
                     ),
@@ -539,13 +988,50 @@ class Database:
     def list_alert_rules(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
         sql = """
             SELECT id, signal_id, signal_name, enabled, buy_threshold, sell_threshold,
-                   cooldown_hours, created_at, updated_at
+                   cooldown_hours, frequency_amount, frequency_unit, start_time, timezone,
+                   market_hours_only, created_at, updated_at
             FROM alert_rules
         """
         if enabled_only:
             sql += " WHERE enabled=1"
         sql += " ORDER BY signal_name"
         return [dict(row) for row in self.query(sql)]
+
+    def update_alert_rule(
+        self,
+        rule_id: int,
+        *,
+        enabled: bool,
+        buy_threshold: float,
+        sell_threshold: float,
+        frequency_amount: int,
+        frequency_unit: str,
+        start_time: str,
+        timezone: str,
+        market_hours_only: bool,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE alert_rules
+                SET enabled=?, buy_threshold=?, sell_threshold=?,
+                    frequency_amount=?, frequency_unit=?, start_time=?,
+                    timezone=?, market_hours_only=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    1 if enabled else 0,
+                    buy_threshold,
+                    sell_threshold,
+                    frequency_amount,
+                    frequency_unit,
+                    start_time,
+                    timezone,
+                    1 if market_hours_only else 0,
+                    datetime.now(UTC).isoformat(),
+                    rule_id,
+                ),
+            )
 
     def latest_scores_for_alert_rules(self) -> list[dict[str, Any]]:
         rows = self.query(
@@ -557,6 +1043,11 @@ class Database:
                 r.buy_threshold,
                 r.sell_threshold,
                 r.cooldown_hours,
+                r.frequency_amount,
+                r.frequency_unit,
+                r.start_time,
+                r.timezone,
+                r.market_hours_only,
                 s.id AS score_id,
                 s.symbol,
                 s.trading_date,
@@ -599,6 +1090,115 @@ class Database:
             (signal_name, symbol, direction),
         )
         return dict(rows[0]) if rows else None
+
+    def upsert_pending_alert(
+        self,
+        *,
+        alert_rule_id: int,
+        signal_id: int | None,
+        signal_name: str,
+        symbol: str,
+        direction: str,
+        score: float,
+        threshold: float,
+        trading_date: str | None,
+        close: float | None,
+        score_id: int | None,
+        message: str,
+    ) -> int:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO pending_alerts(
+                    alert_rule_id, signal_id, signal_name, symbol, direction,
+                    score, threshold, trading_date, close, score_id, status,
+                    message, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ON CONFLICT(signal_name, symbol, direction) WHERE status='pending'
+                DO UPDATE SET
+                    alert_rule_id=excluded.alert_rule_id,
+                    signal_id=excluded.signal_id,
+                    score=excluded.score,
+                    threshold=excluded.threshold,
+                    trading_date=excluded.trading_date,
+                    close=excluded.close,
+                    score_id=excluded.score_id,
+                    message=excluded.message,
+                    updated_at=excluded.updated_at
+                RETURNING id
+                """,
+                (
+                    alert_rule_id,
+                    signal_id,
+                    signal_name,
+                    symbol,
+                    direction,
+                    score,
+                    threshold,
+                    trading_date,
+                    close,
+                    score_id,
+                    message[:2000],
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.fetchone()[0])
+
+    def pending_alerts_for_rules(self) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT
+                p.id,
+                p.alert_rule_id,
+                p.signal_id,
+                p.signal_name,
+                p.symbol,
+                p.direction,
+                p.score,
+                p.threshold,
+                p.trading_date,
+                p.close,
+                p.score_id,
+                p.message,
+                p.created_at,
+                p.updated_at,
+                r.buy_threshold,
+                r.sell_threshold,
+                r.frequency_amount,
+                r.frequency_unit,
+                r.start_time,
+                r.timezone,
+                r.market_hours_only,
+                s.id AS latest_score_id,
+                s.score AS latest_score,
+                s.eligible AS latest_eligible,
+                s.trading_date AS latest_trading_date,
+                s.close AS latest_close
+            FROM pending_alerts p
+            JOIN alert_rules r ON r.id=p.alert_rule_id AND r.enabled=1
+            LEFT JOIN signal_scores s
+              ON lower(s.signal_name)=lower(p.signal_name)
+             AND s.symbol=p.symbol
+             AND s.is_latest=1
+            WHERE p.status='pending'
+            ORDER BY p.updated_at
+            """
+        )
+        return [dict(row) for row in rows]
+
+    def update_pending_alert_status(self, pending_id: int, status: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE pending_alerts
+                SET status=?, updated_at=?
+                WHERE id=?
+                """,
+                (status, datetime.now(UTC).isoformat(), pending_id),
+            )
 
     def upsert_alert_state(
         self,
@@ -728,6 +1328,69 @@ class Database:
             FROM notification_deliveries d
             LEFT JOIN alerts a ON a.id=d.alert_id
             ORDER BY d.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+    def start_scan_cycle_run(self) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO scan_cycle_runs(started_at, status)
+                VALUES (?, 'running')
+                """,
+                (datetime.now(UTC).isoformat(),),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_scan_cycle_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        snapshots_fetched: int = 0,
+        symbols_filtered: int = 0,
+        symbols_scored: int = 0,
+        alerts_created: int = 0,
+        deliveries_attempted: int = 0,
+        delivered: int = 0,
+        duration_seconds: float = 0.0,
+        message: str = "",
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE scan_cycle_runs
+                SET finished_at=?, status=?, snapshots_fetched=?, symbols_filtered=?,
+                    symbols_scored=?, alerts_created=?, deliveries_attempted=?,
+                    delivered=?, duration_seconds=?, message=?
+                WHERE id=?
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    status,
+                    snapshots_fetched,
+                    symbols_filtered,
+                    symbols_scored,
+                    alerts_created,
+                    deliveries_attempted,
+                    delivered,
+                    duration_seconds,
+                    message[:2000],
+                    run_id,
+                ),
+            )
+
+    def recent_scan_cycle_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT started_at, finished_at, status, snapshots_fetched,
+                   symbols_filtered, symbols_scored, alerts_created,
+                   deliveries_attempted, delivered, duration_seconds, message
+            FROM scan_cycle_runs
+            ORDER BY id DESC
             LIMIT ?
             """,
             (limit,),

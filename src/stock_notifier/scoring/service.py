@@ -30,6 +30,7 @@ def score_signal(
     symbols: set[str] | None = None,
     *,
     store: bool = True,
+    include_latest_snapshot: bool = False,
 ) -> list[ScoredSymbol]:
     config = dict(signal_row["config"])
     universe = dict(config.get("universe") or {})
@@ -38,15 +39,26 @@ def score_signal(
         for symbol in universe.get("symbols", [])
         if str(symbol).strip()
     }
+    configured_lists = [
+        str(name).strip()
+        for name in universe.get("lists", [])
+        if str(name).strip()
+    ]
+    configured_list_symbols = database.symbols_for_list_names(configured_lists)
+    configured_universe = configured_symbols | configured_list_symbols
     if symbols is None:
-        if universe.get("mode") == "selected" and configured_symbols:
-            symbols = configured_symbols
+        if universe.get("mode") == "selected" and configured_universe:
+            symbols = configured_universe
         else:
             symbols = set(database.active_symbols())
-    if configured_symbols and universe.get("mode") == "selected":
-        symbols = set(symbols) & configured_symbols
+    if configured_universe and universe.get("mode") == "selected":
+        symbols = set(symbols) & configured_universe
 
-    history = database.load_price_history(symbols, min_bars=320)
+    history = database.load_price_history(
+        symbols,
+        min_bars=320,
+        include_latest_snapshot=include_latest_snapshot,
+    )
     definition = SignalDefinition(
         name=str(signal_row["name"]),
         config=config,
@@ -83,8 +95,18 @@ def score_signal(
     return results
 
 
-def score_enabled_signals(database: Database) -> dict[str, list[ScoredSymbol]]:
+def score_enabled_signals(
+    database: Database,
+    symbols: set[str] | None = None,
+    *,
+    include_latest_snapshot: bool = False,
+) -> dict[str, list[ScoredSymbol]]:
     results: dict[str, list[ScoredSymbol]] = {}
     for signal_row in database.list_signal_definitions(enabled_only=True):
-        results[str(signal_row["name"])] = score_signal(database, signal_row)
+        results[str(signal_row["name"])] = score_signal(
+            database,
+            signal_row,
+            symbols=symbols,
+            include_latest_snapshot=include_latest_snapshot,
+        )
     return results

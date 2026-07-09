@@ -1,178 +1,737 @@
-# Stock Signal Notifier — Project Guide (CLAUDE.md)
+# Stock Signal Notifier
 
-> This file is the single source of truth for the project. It gives any AI assistant (or human collaborator) full context: what we're building, the decisions already made, the tech stack, conventions, and the phased roadmap. Keep it updated as the project evolves.
+A lightweight stock monitoring system for US stocks/ETFs. It fetches delayed/end-of-day market data from Massive/Polygon, stores it in SQLite, computes configurable technical scores, and sends Telegram alerts when saved signal scores cross alert thresholds.
 
----
+The current deployment target is a single Oracle Cloud VM running Ubuntu, Streamlit, SQLite, systemd services, and Caddy as a reverse proxy.
 
-## 1. Project Overview
+## Current status
 
-A cloud-hosted stock monitoring and notification system that:
-
-1. **Fetches market data** (15-min delayed is acceptable) for US stocks and ETFs.
-2. **Computes technical indicators** per symbol: ADX, SMA/EMA crossovers, volume vs. average volume, price change %, and others to be added.
-3. **Scores each asset** with a composite 0–100 score built from those indicators.
-4. **Triggers notifications** (Telegram first; email as fallback) when a symbol crosses buy/sell score thresholds.
-5. **Keeps an alert history** viewable in a simple web dashboard, with each alert linking to a symbol detail view (chart, indicator values, external links to TradingView/Yahoo Finance).
-
-**Long-term goals (post-MVP):** Canadian (TSX) coverage, 5,000+ symbol universe, smarter scoring, backtesting of scoring rules, multi-channel notifications.
-
----
-
-## 2. MVP Scope (Current Phase)
-
-| In scope | Out of scope (later phases) |
+| Area | Status |
 |---|---|
-| US stocks & ETFs only | Canadian/TSX data |
-| Polygon.io **free tier** for development/testing (5 calls/min, end-of-day data) | Polygon **Starter** ($29/mo, unlimited calls, 15-min delayed, full-market snapshot) — upgrade once the pipeline works |
-| ~50–100 test symbols on the free tier | Full 5,000+ universe (requires Starter's snapshot endpoint) |
-| Oracle Cloud Always Free ARM VM as host | Autoscaling, containers/orchestration beyond a single Docker Compose |
-| Data fetch + storage pipeline | Scoring engine & notifications (Phase 2–3) |
-| Simple read-only frontend showing fetched data | Full alert-history dashboard with detail pages |
+| Oracle VM deployment | Working |
+| SQLite data storage | Working |
+| Massive/Polygon grouped daily fetch | Working |
+| Massive/Polygon full-market snapshot scan | Working with Stock Starter plan |
+| Historical backfill | Working |
+| Streamlit dashboard | Working |
+| Configurable Signal Builder | Working |
+| Telegram notification engine | Working |
+| Intraday/full-market scanning | Working as E2-safe filtered scan cycle |
+| Canada/TSX support | Later, requires a second provider |
 
-**MVP definition of done:** An Oracle Cloud VM runs a scheduled Python job that pulls US stock data from Polygon, stores it in a local database, and a web frontend served from the same VM displays the latest data per symbol.
+The project supports daily/end-of-day fetches and a filtered full-market snapshot scan cycle. The snapshot cycle is designed to stay safe on the small Oracle E2.1.Micro VM by filtering the full market before scoring.
 
----
+## Architecture
 
-## 3. Architecture
-
-```
-┌─────────────────────────── Oracle Cloud Free Tier (Ampere A1 ARM VM) ───────────────────────────┐
-│                                                                                                  │
-│  scheduler (cron / APScheduler)                                                                  │
-│        │                                                                                         │
-│        ▼                                                                                         │
-│  fetcher (Python) ──► Polygon.io REST API (free tier now → Starter later)                        │
-│        │                                                                                         │
-│        ▼                                                                                         │
-│  SQLite database (MVP) ──► migrate to Postgres later if needed                                   │
-│        │                                                                                         │
-│        ▼                                                                                         │
-│  scorer (Phase 2: pandas-ta / TA-Lib → composite score)                                          │
-│        │                                                                                         │
-│        ├──► notifier (Phase 3: Telegram Bot API, free)                                           │
-│        │                                                                                         │
-│        ▼                                                                                         │
-│  frontend (FastAPI backend + lightweight web UI, or Streamlit) — port 80/443 via reverse proxy   │
-│                                                                                                  │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+```text
+Massive/Polygon API
+        │
+        ▼
+ stock-notifier fetch-daily / backfill / run-scan-cycle
+        │
+        ▼
+ SQLite database
+        │
+        ├── Streamlit dashboard
+        │
+        ├── Signal Builder / scoring engine
+        │
+        └── Scheduled Telegram alert engine
 ```
 
----
+On the Oracle VM:
 
-## 4. Tech Stack & Key Decisions
-
-| Layer | Choice | Rationale |
-|---|---|---|
-| **Hosting** | Oracle Cloud Always Free — Ampere A1 (up to 4 OCPU / 24 GB RAM), Ubuntu 22.04+ | Genuinely free forever, generous specs, runs 24/7. Note: ARM64 architecture — verify all Python wheels/binaries support ARM. |
-| **Market data** | Polygon.io — free tier now, **Starter ($29/mo)** when scaling | Free tier: 5 API calls/min, end-of-day aggregates — fine for building the pipeline against a small symbol list. Starter: unlimited calls, 15-min delayed, **full-market snapshot endpoint** (all US tickers in ~1 call) — the key to scanning 5k+ symbols. US-only (no TSX), which matches MVP scope. |
-| **Language** | Python 3.11+ | User preference; rich TA ecosystem. |
-| **Scheduler** | cron (simple) or APScheduler (in-process, market-hours aware) | Start with cron; move to APScheduler when market-hours logic matters. |
-| **Database** | SQLite (MVP) | Zero setup, one file, fine for single-writer workloads. Migrate to Postgres (local or free Supabase/Neon) if concurrency or size demands it. |
-| **TA library (Phase 2)** | pandas-ta (pure Python, easy ARM install) or TA-Lib (faster, C library) | Both compute ADX, SMA/EMA, volume metrics. Start with pandas-ta to avoid ARM build friction. |
-| **Notifications (Phase 3)** | Telegram Bot API | Free, unlimited, instant push, trivial HTTP API. Email (SMTP) as fallback. |
-| **Frontend** | Option A: **Streamlit** (fastest to build) · Option B: **FastAPI + Jinja2/HTMX or small JS UI** (more control, better long-term) | MVP recommendation: Streamlit for speed; revisit at Phase 4. |
-| **Reverse proxy** | Caddy (auto-HTTPS) or Nginx | Expose the frontend on 80/443. |
-| **Process management** | systemd services (fetcher, frontend) or Docker Compose | systemd is simplest on a single VM. |
-| **Secrets** | `.env` file (never committed) loaded via python-dotenv | Polygon API key, Telegram token later. |
-
----
-
-## 5. Repository Layout (planned)
-
+```text
+Caddy :80/:443 ──► Streamlit 127.0.0.1:8501
+systemd timer    ──► scheduled fetch/scan cycle
+SQLite           ──► /opt/stock-notifier/data/stock_notifier.db
 ```
+
+## Repository layout
+
+```text
 stock-notifier/
-├── README.md            # this file
-├── .env.example         # POLYGON_API_KEY=..., DB_PATH=...
-├── requirements.txt
 ├── config/
-│   └── symbols.txt      # MVP watchlist (~50–100 US tickers)
-├── src/
-│   ├── fetcher/         # Polygon client, rate limiting, retries
-│   ├── db/              # schema, migrations, data access
-│   ├── scorer/          # Phase 2: indicators + composite score
-│   ├── notifier/        # Phase 3: Telegram/email dispatch
-│   └── frontend/        # dashboard app
-├── scripts/             # one-off ops scripts (backfill, healthcheck)
-└── deploy/              # systemd unit files, Caddyfile, setup notes
+│   └── symbols.txt
+├── deploy/
+│   ├── Caddyfile
+│   ├── stock-notifier-dashboard.service
+│   ├── stock-notifier-fetch.service
+│   └── stock-notifier-fetch.timer
+├── scripts/
+│   └── bootstrap_server.sh
+├── src/stock_notifier/
+│   ├── cli.py
+│   ├── config.py
+│   ├── dashboard.py
+│   ├── db.py
+│   ├── ingest.py
+│   ├── models.py
+│   ├── notifications/
+│   ├── providers/
+│   ├── scoring/
+│   └── symbols.py
+├── tests/
+├── .env.example
+├── pyproject.toml
+└── README.md
 ```
 
----
+## Configuration
 
-## 6. Database Schema (MVP)
+Copy `.env.example` to `.env` and fill the real private values.
 
-- **symbols** — ticker, name, exchange, type (stock/ETF), active flag
-- **daily_bars** — symbol, date, open, high, low, close, volume (from Polygon aggregates)
-- **fetch_log** — run timestamp, symbols fetched, errors, duration (observability from day one)
-- *(Phase 2+)* **scores** — symbol, timestamp, indicator values, composite score
-- *(Phase 3+)* **alerts** — symbol, timestamp, direction (buy/sell), score, notified channels
+Important: `.env` must never be committed or publicly exposed. `.env.example` should contain placeholders only.
 
----
+Core variables:
 
-## 7. Polygon Free-Tier Constraints (important for MVP design)
+```env
+MASSIVE_API_KEY=your_massive_api_key_here
+DB_PATH=/opt/stock-notifier/data/stock_notifier.db
+SYMBOLS_PATH=/opt/stock-notifier/config/symbols.txt
+MASSIVE_BASE_URL=https://api.massive.com
+MASSIVE_REQUESTS_PER_MINUTE=5
+MASSIVE_PROFILE_REQUESTS_PER_MINUTE=120
+MASSIVE_HTTP_TIMEOUT_SECONDS=30
+LOG_LEVEL=INFO
+```
 
-- **5 API calls/minute** — the fetcher MUST rate-limit itself (e.g., token bucket, 12s between calls) and handle HTTP 429 gracefully with backoff.
-- Free tier provides **end-of-day / previous-day data**, not intraday — design the pipeline so switching to Starter's snapshot + 15-min-delayed data later is a config change, not a rewrite. Abstract the data source behind a `MarketDataProvider` interface.
-- Use the **grouped daily bars endpoint** (`/v2/aggs/grouped/...`) where possible — it returns the entire US market's daily OHLCV in a single call, which is the most rate-limit-efficient way to populate the DB even on the free tier.
-- Backfill history (needed later for ADX/MA which require 20–50+ bars) via per-symbol aggregate calls, throttled.
+Telegram variables:
 
----
+```env
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+TELEGRAM_CHAT_ID=your_telegram_chat_id_here
+DASHBOARD_BASE_URL=https://your-dashboard-domain-or-ip
+ALERT_DEFAULT_BUY_THRESHOLD=75
+ALERT_DEFAULT_SELL_THRESHOLD=40
+ALERT_COOLDOWN_HOURS=12
+ALERT_DEFAULT_FREQUENCY_AMOUNT=15
+ALERT_DEFAULT_FREQUENCY_UNIT=minutes
+ALERT_DEFAULT_START_TIME=09:45
+ALERT_DEFAULT_TIMEZONE=America/Toronto
+ALERT_DEFAULT_MARKET_HOURS_ONLY=true
+ALERT_DRY_RUN=true
+```
 
-## 8. Roadmap
+Scan-cycle variables for the paid Massive/Polygon Starter plan:
+
+```env
+SCAN_MAX_SYMBOLS=500
+SCAN_MIN_PRICE=5
+SCAN_MIN_DAY_VOLUME=500000
+SCAN_MARKET_HOURS_ONLY=true
+SCAN_LOCK_PATH=/opt/stock-notifier/data/scan-cycle.lock
+```
+
+Dashboard variables:
+
+```env
+DASHBOARD_ADDRESS=127.0.0.1
+DASHBOARD_PORT=8501
+```
+
+For the current Oracle IP deployment, the private server `.env` can use:
+
+```env
+DASHBOARD_BASE_URL=http://YOUR_SERVER_IP
+```
+
+## Local setup
+
+From Windows PowerShell:
+
+```powershell
+cd "L:\Signal Notifier"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install -e .[dev]
+copy .env.example .env
+```
+
+Edit `.env`, then initialize:
+
+```powershell
+stock-notifier init-db
+stock-notifier sync-symbols
+```
+
+Fetch latest available daily data:
+
+```powershell
+stock-notifier fetch-daily
+```
+
+Backfill a small subset for MA/ADX testing:
+
+```powershell
+stock-notifier backfill --days 320 --symbols AAPL,MSFT,NVDA,SPY,QQQ
+```
+
+Run the dashboard locally:
+
+```powershell
+streamlit run src\stock_notifier\dashboard.py
+```
+
+## CLI commands
+
+Database and data ingestion:
+
+```powershell
+stock-notifier init-db
+stock-notifier sync-symbols
+stock-notifier sync-profiles --limit 100
+stock-notifier sync-profiles --limit 100 --requests-per-minute 240
+stock-notifier sync-profiles --symbols AAPL,MSFT,NVDA
+stock-notifier fetch-daily
+stock-notifier fetch-daily --date 2026-07-08
+stock-notifier backfill --days 90 --symbols AAPL,MSFT,SPY
+```
+
+`sync-profiles` uses `MASSIVE_PROFILE_REQUESTS_PER_MINUTE`, not the conservative `MASSIVE_REQUESTS_PER_MINUTE` used by normal market-data calls. On a paid Massive stocks plan, increasing profile sync to 120–240 requests/minute makes metadata backfills much faster.
+
+Some snapshot symbols, especially preferred/share-class tickers, may not have a Massive ticker-overview profile. `sync-profiles` records those as unavailable placeholders so they are not retried in every batch.
+
+Signal scoring:
+
+```powershell
+stock-notifier seed-signals
+stock-notifier list-signals
+stock-notifier score --signal "MA Momentum" --symbols AAPL,MSFT,NVDA
+stock-notifier score-all
+```
+
+Telegram notifications:
+
+```powershell
+stock-notifier telegram-test --dry-run
+stock-notifier telegram-test
+stock-notifier alert-rules-seed
+stock-notifier alerts-scan --dry-run
+stock-notifier alerts-scan
+stock-notifier alerts-scan --send
+stock-notifier alerts-history --limit 20
+```
+
+Intraday/full-market scan cycle:
+
+```powershell
+stock-notifier run-scan-cycle --dry-run --benchmark --max-symbols 50
+stock-notifier run-scan-cycle --benchmark --max-symbols 500
+```
+
+The scan cycle performs:
+
+```text
+full-market snapshot → price/volume filters → score enabled signals → scheduled alert scan → Telegram
+```
+
+## Dashboard
+
+The Streamlit dashboard currently includes:
+
+- **Market data** — Stocks universe/list view selector, searchable symbol/company lookup, range selector, aligned price and volume chart.
+- **Lists** — create, rename, describe, populate, prune, and delete reusable stock lists.
+- **Signal Builder** — configurable technical-signal definitions stored in SQLite, with inline component help, examples, and universe selection by lists/tickers.
+- **Notifications** — Telegram configuration status, editable scheduled alert rules, pending alerts, recent alerts, and delivery history.
+- **Pipeline health** — fetch logs, signal-run history, and scan-cycle history.
+
+The Signal Builder supports weighted score components and hard gate/filter components. Current component types include:
+
+- close vs SMA
+- close vs EMA
+- SMA crossover
+- EMA crossover
+- ADX
+- volume ratio
+- latest volume
+- dollar volume
+- price change %
+
+Starter signal templates:
+
+- `MA Momentum`
+- `Institutional Momentum`
+- `Volume Breakout`
+- `Trend Quality`
+
+### Custom symbol lists
+
+The dashboard has a dedicated **Lists** tab. Use it to create reusable groups such as:
+
+- `Portfolio`
+- `Potential`
+- `High conviction`
+- `AI stocks`
+- `Energy watch`
+
+You can create lists, rename them, edit descriptions, add comma-separated tickers, search the stock universe for close matches, remove members, or delete an entire list.
+
+The **Market data** tab lets you choose a single view with checkbox-style selectors:
+
+- **Stocks universe** — the full active stock universe currently in the database.
+- Any custom list you created, such as `Portfolio` or `Potential`.
+
+Only one Market Data view is active at a time. The table, symbol search, and chart selector all use the selected view.
+
+Signal definitions can then use:
+
+```text
+Universe: selected
+Selected lists: Portfolio, Potential
+Extra selected tickers: NVDA, MSFT
+```
+
+The signal will run only on the union of the selected lists and extra tickers. If a scan cycle also passes a filtered symbol set, the signal uses the intersection so VM-safe scan filters still apply.
+
+## Signal Builder guide
+
+The Signal Builder lets you define a ranking formula without changing Python code. A signal is made of components. Each component calculates one technical value, then uses that value either as a pass/fail filter or as part of the final 0–100 score.
+
+### Score mode vs gate mode
+
+Use **gate** when a condition is mandatory. If a gate fails, the symbol is filtered out and its final score becomes 0. Gates are good for “must be true” rules:
+
+- close must be above SMA50
+- SMA50 must be above SMA200
+- ADX14 must be at least 25
+- volume must be at least 2x average volume
+
+Gate components do not contribute to the final score. In component breakdowns, gate score, weight, and contribution are shown as `0`; only `passed` matters.
+
+Use **score** when a condition should rank symbols but not automatically reject them. Score components are normalized to 0–100, multiplied by their weight, and averaged into the final signal score. Score components are good for “more is better” rules:
+
+- stronger 5-day momentum
+- larger distance above SMA20
+- higher relative volume
+- stronger ADX
+
+Example:
+
+```text
+Gate:  Close above SMA50       → must pass
+Gate:  ADX14 >= 25             → must pass
+Score: 5-day price change %    → ranks stronger movers higher
+Score: Volume ratio            → ranks unusual volume higher
+```
+
+### Field meanings
+
+| Field | Meaning |
+|---|---|
+| Type | The indicator/value to calculate. |
+| Name | Friendly label used in previews, score breakdowns, and alert explanations. |
+| Mode | `gate` filters symbols; `score` contributes to the final ranking. |
+| Op | Comparison operator used with threshold. |
+| Threshold | The pass line. Example: `>= 0` for “above moving average”; `>= 25` for ADX trend strength; `>= 2` for 2x average volume. |
+| Weight | Importance of a score component. Weight 2 counts twice as much as weight 1. Ignored for gates. |
+| Period | Number of daily bars used for the indicator. In 15-minute scan cycles, the latest snapshot is appended as the current bar, but historical lookbacks are still daily bars in this version. |
+| Slow period | For crossover components only. The main Period is the fast average; Slow period is the slower comparison average. |
+| Score min | Raw value that maps near 0 points for a score component. |
+| Score max | Raw value that maps near 100 points for a score component. |
+
+### Component types
+
+| Type | Raw value produced | Common use |
+|---|---:|---|
+| Close vs SMA | Percent distance between latest close and SMA. | Trend gate or price extension score. |
+| Close vs EMA | Percent distance between latest close and EMA. | Faster trend gate than SMA. |
+| SMA crossover / stack | Percent distance between fast SMA and slow SMA. | MA stack/crossover confirmation. |
+| EMA crossover / stack | Percent distance between fast EMA and slow EMA. | Faster crossover confirmation. |
+| ADX trend strength | ADX value. | Trend-strength filter or score. |
+| Relative volume | Current volume divided by average volume. | Volume breakout detection. |
+| Latest volume | Latest volume. In scan cycles this is current day volume from the latest snapshot. | Raw liquidity filter. |
+| Dollar volume | Latest close multiplied by latest volume. | Price-adjusted liquidity filter. |
+| Price change % | Percent price change over N daily bars. | Momentum ranking. |
+
+### Useful component recipes
+
+Close above SMA50:
+
+```text
+Type: Close vs SMA
+Mode: gate
+Op: >=
+Threshold: 0
+Period: 50
+```
+
+SMA5 above SMA20:
+
+```text
+Type: SMA crossover / stack
+Mode: gate
+Op: >=
+Threshold: 0
+Period: 5
+Slow period: 20
+```
+
+SMA50 above SMA200:
+
+```text
+Type: SMA crossover / stack
+Mode: gate
+Op: >=
+Threshold: 0
+Period: 50
+Slow period: 200
+```
+
+ADX14 trend strength:
+
+```text
+Type: ADX trend strength
+Mode: gate
+Op: >=
+Threshold: 25
+Period: 14
+```
+
+Volume breakout:
+
+```text
+Type: Relative volume
+Mode: score
+Op: >=
+Threshold: 1
+Period: 20
+Score min: 1
+Score max: 3
+Weight: 1
+```
+
+Dollar-volume liquidity filter:
+
+```text
+Type: Dollar volume
+Mode: gate
+Op: >=
+Threshold: 100000
+```
+
+This keeps only symbols where:
+
+```text
+latest close × latest volume >= 100,000
+```
+
+For example, a $10 stock needs at least 10,000 shares of volume to pass.
+
+5-day momentum:
+
+```text
+Type: Price change %
+Mode: score
+Op: >=
+Threshold: 0
+Period: 5
+Score min: 0
+Score max: 8
+Weight: 1
+```
+
+Price-change ranking with dollar-volume filter:
+
+```text
+Component 1:
+Type: Dollar volume
+Mode: gate
+Op: >=
+Threshold: 100000
+
+Component 2:
+Type: Price change %
+Mode: score
+Op: >=
+Threshold: 0
+Change days: 1
+Score min: 0
+Score max: 10
+Weight: 1
+```
+
+This filters out illiquid symbols, then ranks the remaining symbols by strongest 1-day price change. For a 5-day momentum version, set `Change days` to `5`.
+
+### Example signals
+
+MA Momentum:
+
+```text
+Gate:  SMA5 above SMA20
+Gate:  Close above SMA50
+Score: 5-day momentum, score min 0, score max 8
+Score: Close vs SMA20, score min 0, score max 10
+```
+
+Institutional Momentum:
+
+```text
+Gate:  Close above SMA50
+Gate:  SMA50 above SMA200
+Gate:  ADX14 >= 25
+Score: Close vs SMA50, score min 0, score max 15
+```
+
+Volume Breakout:
+
+```text
+Gate:  Price change % >= 0 over 1 daily bar
+Score: Relative volume, score min 1, score max 3
+Score: 5-day momentum, score min 0, score max 8
+```
+
+Trend Quality:
+
+```text
+Gate:  Close above SMA200
+Score: ADX14, score min 15, score max 35
+Score: SMA20 above SMA50, score min 0, score max 5
+Score: Close vs EMA20, score min 0, score max 8
+```
+
+### Practical tips
+
+- Start with gates to remove stocks you do not want, then use scores to rank the survivors.
+- Use `threshold = 0` for moving-average distance/crossover checks when you mean “above.”
+- Use ADX as trend strength, not direction. Combine it with MA or price-position gates for bullish/bearish context.
+- Keep score ranges realistic. If Score max is too high, everything scores low; if too low, everything maxes out at 100.
+- For the current E2.1.Micro VM, prefer filtered scan cycles such as `--max-symbols 50` to `500` until you confirm runtime is stable.
+
+## Telegram setup
+
+1. Open Telegram and search for `@BotFather`.
+2. Send `/newbot`.
+3. Choose a display name, for example `Stock Notifier`.
+4. Choose a username ending in `bot`.
+5. Copy the bot token into private `.env` as `TELEGRAM_BOT_TOKEN`.
+6. Open your new bot chat and send `/start`.
+7. In PowerShell, run:
+
+```powershell
+$TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+$response = Invoke-RestMethod "https://api.telegram.org/bot$TOKEN/getUpdates"
+$response.result | ConvertTo-Json -Depth 10
+```
+
+8. Use `message.chat.id` as `TELEGRAM_CHAT_ID`.
+
+Do not use the bot ID from `getMe`; Telegram will reject that with:
+
+```text
+Forbidden: the bot can't send messages to the bot
+```
+
+Test with:
+
+```powershell
+stock-notifier telegram-test --dry-run
+```
+
+Then set:
+
+```env
+ALERT_DRY_RUN=false
+```
+
+and run:
+
+```powershell
+stock-notifier telegram-test
+```
+
+## Alert behavior
+
+Alerts are based on saved `signal_scores`, not unsaved Signal Builder previews.
+
+Default behavior:
+
+- BUY alert fires when score crosses to `>= ALERT_DEFAULT_BUY_THRESHOLD`.
+- SELL alert fires when score drops to `<= ALERT_DEFAULT_SELL_THRESHOLD` after a prior higher state.
+- Cooldown prevents repeated alerts for the same signal/symbol/direction.
+- Dry-run mode records delivery rows without calling Telegram.
+
+Recommended chain:
+
+```text
+fetch-daily → score-all → alerts-scan → Telegram
+```
+
+## Oracle server operations
+
+SSH key location currently used:
+
+```powershell
+$KEY = "L:\ssh-oracle\ssh-key-2026-07-06.key"
+$SERVER = "ubuntu@YOUR_SERVER_IP"
+ssh -i $KEY $SERVER
+```
+
+On the server:
+
+```bash
+cd /opt/stock-notifier
+source .venv/bin/activate
+```
+
+Initialize/update schema:
+
+```bash
+stock-notifier init-db
+```
+
+Run the daily pipeline manually:
+
+```bash
+stock-notifier fetch-daily
+stock-notifier score-all
+stock-notifier alerts-scan --dry-run
+```
+
+Run the 15-minute delayed snapshot scan manually:
+
+```bash
+stock-notifier run-scan-cycle --dry-run --benchmark --max-symbols 50
+```
+
+Restart dashboard:
+
+```bash
+sudo systemctl restart stock-notifier-dashboard.service
+systemctl status stock-notifier-dashboard.service --no-pager
+```
+
+Check logs:
+
+```bash
+journalctl -u stock-notifier-dashboard.service -n 100 --no-pager
+journalctl -u stock-notifier-fetch.service -n 100 --no-pager
+```
+
+Edit server `.env`:
+
+```bash
+nano /opt/stock-notifier/.env
+```
+
+Lock down server secrets:
+
+```bash
+sudo chown ubuntu:ubuntu /opt/stock-notifier/.env
+chmod 600 /opt/stock-notifier/.env
+```
+
+## Deploy local code changes to Oracle
+
+From local Windows PowerShell:
+
+```powershell
+$KEY = "L:\ssh-oracle\ssh-key-2026-07-06.key"
+$SERVER = "ubuntu@YOUR_SERVER_IP"
+```
+
+Copy changed source files:
+
+```powershell
+scp -i $KEY -r "L:\Signal Notifier\src\stock_notifier\scoring" "${SERVER}:/opt/stock-notifier/src/stock_notifier/"
+scp -i $KEY -r "L:\Signal Notifier\src\stock_notifier\notifications" "${SERVER}:/opt/stock-notifier/src/stock_notifier/"
+scp -i $KEY "L:\Signal Notifier\src\stock_notifier\config.py" "${SERVER}:/opt/stock-notifier/src/stock_notifier/config.py"
+scp -i $KEY "L:\Signal Notifier\src\stock_notifier\db.py" "${SERVER}:/opt/stock-notifier/src/stock_notifier/db.py"
+scp -i $KEY "L:\Signal Notifier\src\stock_notifier\cli.py" "${SERVER}:/opt/stock-notifier/src/stock_notifier/cli.py"
+scp -i $KEY "L:\Signal Notifier\src\stock_notifier\dashboard.py" "${SERVER}:/opt/stock-notifier/src/stock_notifier/dashboard.py"
+```
+
+Then on the server:
+
+```bash
+cd /opt/stock-notifier
+source .venv/bin/activate
+python -m py_compile src/stock_notifier/*.py src/stock_notifier/scoring/*.py src/stock_notifier/notifications/*.py
+stock-notifier init-db
+sudo systemctl restart stock-notifier-dashboard.service
+```
+
+## Security notes
+
+- Never commit `.env`.
+- Keep real API keys, Telegram token, and chat ID only in private local/server `.env` files.
+- `.env.example` must contain placeholders only.
+- If a Telegram bot token is exposed, rotate it with BotFather using `/revoke`.
+- Do not open Streamlit port `8501` publicly. Keep it bound to `127.0.0.1`; expose only Caddy on port `80`/`443`.
+- On OCI, allow SSH only from your public IP when possible.
+
+## Database tables
+
+Current SQLite schema includes:
+
+- `symbols`
+- `symbol_lists`
+- `symbol_list_members`
+- `company_profiles`
+- `daily_bars`
+- `market_snapshots`
+- `fetch_log`
+- `signal_definitions`
+- `signal_runs`
+- `signal_scores`
+- `signal_score_components`
+- `notification_channels`
+- `alert_rules`
+- `alerts`
+- `notification_deliveries`
+- `alert_state`
+- `pending_alerts`
+- `scan_cycle_runs`
+
+`company_profiles` stores Massive ticker overview metadata such as name, primary exchange, market cap, SIC code, and SIC description. Start with SIC description as the first industry classification; richer sector mapping can be added later.
+
+## Testing
+
+Run from local PowerShell:
+
+```powershell
+cd "L:\Signal Notifier"
+.\.venv\Scripts\Activate.ps1
+pytest -q
+```
+
+Compile check:
+
+```powershell
+python -m py_compile src\stock_notifier\*.py src\stock_notifier\scoring\*.py src\stock_notifier\notifications\*.py
+```
+
+Note: invoking Windows Python from WSL can trigger a WSL socket error. Prefer running tests directly from Windows PowerShell.
+
+## Roadmap
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| **1. Infra + Data + Display (MVP)** | Oracle VM provisioned; fetcher pulling Polygon data on schedule into SQLite; frontend showing latest data | ⬅ **current** |
-| **2. Scoring engine** | Indicator computation (ADX, SMA/EMA, volume ratio, % change), composite score, score table in DB & frontend | pending |
-| **3. Notifications + alert history** | Telegram bot alerts on threshold crossings; alerts table; history page with detail links | pending |
-| **4. Scale-up** | Upgrade to Polygon Starter ($29/mo); full US universe via snapshot endpoint; 15-min scan cycle during market hours; frontend hardening | pending |
-| **5. Extensions** | TSX/Canada data (requires a second provider — e.g., EODHD or Twelve Data), backtesting of scoring rules, more channels | pending |
+| 1 | Infra, data fetch, SQLite, dashboard | Complete |
+| 2 | Configurable scoring engine and Signal Builder | Complete |
+| 3 | Telegram notifications and alert history | Complete |
+| 4 | Scheduled alert rules and E2-safe scan cycle | Implemented |
+| 5 | Production 15-minute systemd timer and cloud rollout | Next |
+| 6 | Backtesting and signal performance analytics | Later |
+| 7 | Canada/TSX support via second provider | Later |
 
-**Cost forecast:** $0/mo during MVP (Oracle free tier + Polygon free tier + Telegram free). ~$29/mo at Phase 4 (Polygon Starter). Canadian data at Phase 5 adds ~$20–80/mo depending on provider.
+## Cost model
 
----
+Daily/EOD MVP can run at approximately $0/month:
 
-## 9. Conventions for AI-Assisted Development
+- Oracle Cloud VM: Always Free
+- Massive/Polygon: free tier
+- Telegram: free
+- SQLite: local file
 
-- Python 3.11+, type hints everywhere, `ruff` for lint/format.
-- All external calls (Polygon, Telegram) wrapped with retries + timeouts; never let one symbol's failure kill a run.
-- All configuration via environment variables / `.env`; no secrets in code or git.
-- Every scheduled run writes to `fetch_log` — the system must be debuggable from the DB alone.
-- Keep the data-provider layer abstract so Polygon free → Starter → (later) a TSX provider are drop-in changes.
-- Small, reviewable commits per component (fetcher, db, frontend separately).
+The 15-minute delayed full-market scan cycle requires a paid Massive/Polygon stocks plan such as Stock Starter. Keep `SCAN_MAX_SYMBOLS` conservative on the Oracle E2.1.Micro until benchmark runs prove the VM can keep up.
 
----
----
+Likely future cost:
 
-## 🚀 Initial Prompt — Phase 1, Step 1
-
-Copy the prompt below into a fresh session (e.g., Claude Code on the VM or locally) to kick off implementation:
+- Massive/Polygon Starter or equivalent for broader/faster US coverage.
+- Separate provider for Canadian/TSX coverage.
 
 ---
 
-> **Context:** Read `README.md` in this repo — it contains the full project plan, stack decisions, and conventions. We are starting **Phase 1 (MVP)**: Oracle Cloud infra + Polygon data fetcher + simple frontend, US stocks only, Polygon free tier (5 calls/min, end-of-day data).
->
-> **Your task — Step 1 of Phase 1, in this order:**
->
-> **1. Oracle Cloud VM setup (guide me interactively):**
-> - Walk me through provisioning an **Always Free Ampere A1** instance (Ubuntu 22.04 or 24.04, 2 OCPU / 12 GB RAM is plenty to start — leaving free-tier headroom), including SSH key setup, and opening ingress ports 22, 80, and 443 in the VCN security list.
-> - Then give me a server bootstrap checklist/script: create a non-root user, enable ufw (or use OCI security lists only — recommend one), install Python 3.11+, pip, git, and set up an app directory at `/opt/stock-notifier`.
->
-> **2. Project scaffolding:**
-> - Create the repository structure exactly as specified in README section 5, with `requirements.txt`, `.env.example` (POLYGON_API_KEY, DB_PATH), and a `config/symbols.txt` seeded with ~50 liquid US tickers/ETFs (e.g., AAPL, MSFT, NVDA, SPY, QQQ...).
->
-> **3. Polygon fetcher (free-tier aware):**
-> - Implement `src/fetcher/` with: a rate limiter respecting **5 calls/min**, retry with exponential backoff on 429/5xx, and two fetch modes: (a) **grouped daily bars** (whole-market in one call) filtered to our watchlist, and (b) per-symbol historical backfill (last 60 trading days) for future indicator needs.
-> - Implement `src/db/` with the SQLite schema from README section 6 (symbols, daily_bars, fetch_log) and idempotent upserts.
-> - Wire a cron-ready entrypoint script that runs the daily fetch and logs to `fetch_log`.
->
-> **4. Minimal frontend:**
-> - Build a **Streamlit** app in `src/frontend/` that reads the SQLite DB and shows: a table of all watchlist symbols with latest close, volume, and daily % change (sortable), a per-symbol page with a price/volume chart from stored bars, and the last 10 entries of `fetch_log` as a health indicator.
-> - Provide the systemd unit files (fetcher timer/service + Streamlit service) and a Caddyfile so the frontend is reachable on port 80.
->
-> **Constraints:** Follow all conventions in README section 9. The VM is **ARM64** — verify every dependency installs cleanly on aarch64. Design the data-provider layer so upgrading to Polygon Starter (snapshot endpoint, 15-min delayed) later is a configuration change. Do not build the scoring engine or notifications yet — that's Phase 2–3.
->
-> Start with item 1 and wait for my confirmation that the VM is up before generating the code for items 2–4.
-
----
-
-*Last updated: 2026-07-04 · Phase 1 in progress*
+Last updated: 2026-07-09.

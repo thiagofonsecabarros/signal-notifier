@@ -10,7 +10,7 @@ from typing import Any
 
 import requests
 
-from stock_notifier.models import DailyBar
+from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot
 from stock_notifier.providers.base import MarketDataNotAvailableError
 
 LOGGER = logging.getLogger(__name__)
@@ -123,6 +123,83 @@ class MassiveClient:
             transactions=int(result["n"]) if result.get("n") is not None else None,
         )
 
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _timestamp_from_provider_value(value: Any) -> datetime:
+        try:
+            timestamp = int(value)
+        except (TypeError, ValueError):
+            return datetime.now(UTC)
+
+        # Snapshot payloads may use seconds, milliseconds, microseconds, or
+        # nanoseconds depending on the nested source field. Normalize by
+        # magnitude so Windows/Python do not choke on nanosecond values.
+        absolute = abs(timestamp)
+        if absolute >= 10**18:
+            divisor = 1_000_000_000
+        elif absolute >= 10**15:
+            divisor = 1_000_000
+        elif absolute >= 10**12:
+            divisor = 1_000
+        else:
+            divisor = 1
+
+        try:
+            return datetime.fromtimestamp(timestamp / divisor, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return datetime.now(UTC)
+
+    @classmethod
+    def _snapshot_from_result(cls, result: dict[str, Any]) -> MarketSnapshot | None:
+        symbol = str(result.get("ticker") or result.get("T") or "").upper().strip()
+        if not symbol:
+            return None
+
+        day = result.get("day") if isinstance(result.get("day"), dict) else {}
+        minute = result.get("min") if isinstance(result.get("min"), dict) else {}
+        previous_day = result.get("prevDay") if isinstance(result.get("prevDay"), dict) else {}
+        last_trade = result.get("lastTrade") if isinstance(result.get("lastTrade"), dict) else {}
+
+        price = (
+            cls._float_or_none(day.get("c"))
+            or cls._float_or_none(minute.get("c"))
+            or cls._float_or_none(last_trade.get("p"))
+            or cls._float_or_none(previous_day.get("c"))
+        )
+        if price is None:
+            return None
+
+        previous_close = cls._float_or_none(previous_day.get("c"))
+        percent_change = ((price / previous_close - 1.0) * 100.0) if previous_close else None
+        timestamp = (
+            result.get("updated")
+            or minute.get("t")
+            or day.get("t")
+            or last_trade.get("t")
+        )
+
+        return MarketSnapshot(
+            symbol=symbol,
+            snapshot_at=cls._timestamp_from_provider_value(timestamp),
+            price=price,
+            day_open=cls._float_or_none(day.get("o")),
+            day_high=cls._float_or_none(day.get("h")),
+            day_low=cls._float_or_none(day.get("l")),
+            day_close=cls._float_or_none(day.get("c")) or price,
+            day_volume=cls._float_or_none(day.get("v")),
+            previous_close=previous_close,
+            percent_change=percent_change,
+            minute_volume=cls._float_or_none(minute.get("v")),
+        )
+
     def grouped_daily(self, trading_date: date, symbols: set[str]) -> list[DailyBar]:
         payload = self._get(
             f"/v2/aggs/grouped/locale/us/market/stocks/{trading_date.isoformat()}",
@@ -140,3 +217,57 @@ class MassiveClient:
             {"adjusted": "true", "sort": "asc", "limit": 50000},
         )
         return [self._bar_from_result(result, symbol) for result in payload.get("results", [])]
+
+    def full_market_snapshot(self) -> list[MarketSnapshot]:
+        payload = self._get("/v2/snapshot/locale/us/markets/stocks/tickers")
+        snapshots: list[MarketSnapshot] = []
+        for result in payload.get("tickers", []) or []:
+            if not isinstance(result, dict):
+                continue
+            snapshot = self._snapshot_from_result(result)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return snapshots
+
+    def ticker_overview(self, symbol: str) -> CompanyProfile | None:
+        normalized_symbol = symbol.upper()
+        try:
+            payload = self._get(f"/v3/reference/tickers/{normalized_symbol}")
+        except RuntimeError as error:
+            message = str(error)
+            if "HTTP 404" in message or "Ticker not found" in message:
+                LOGGER.info("Massive ticker overview not found for %s", normalized_symbol)
+                return None
+            raise
+        result = payload.get("results")
+        if not isinstance(result, dict):
+            return None
+        branding = result.get("branding") if isinstance(result.get("branding"), dict) else {}
+        employees = result.get("total_employees")
+        try:
+            total_employees = int(employees) if employees is not None else None
+        except (TypeError, ValueError):
+            total_employees = None
+        return CompanyProfile(
+            ticker=str(result.get("ticker") or symbol).upper(),
+            name=str(result.get("name") or ""),
+            market=str(result.get("market") or ""),
+            locale=str(result.get("locale") or ""),
+            primary_exchange=str(result.get("primary_exchange") or ""),
+            type=str(result.get("type") or ""),
+            active=bool(result.get("active", True)),
+            currency_name=str(result.get("currency_name") or ""),
+            cik=str(result.get("cik") or ""),
+            composite_figi=str(result.get("composite_figi") or ""),
+            share_class_figi=str(result.get("share_class_figi") or ""),
+            sic_code=str(result.get("sic_code") or ""),
+            sic_description=str(result.get("sic_description") or ""),
+            market_cap=self._float_or_none(result.get("market_cap")),
+            weighted_shares_outstanding=self._float_or_none(result.get("weighted_shares_outstanding")),
+            total_employees=total_employees,
+            homepage_url=str(result.get("homepage_url") or ""),
+            description=str(result.get("description") or ""),
+            list_date=str(result.get("list_date") or ""),
+            logo_url=str(branding.get("logo_url") or ""),
+            icon_url=str(branding.get("icon_url") or ""),
+        )
