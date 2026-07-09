@@ -8,6 +8,7 @@ import streamlit as st
 
 from stock_notifier.config import Settings
 from stock_notifier.db import Database
+from stock_notifier.notifications.service import scan_alerts, seed_alert_rules, send_telegram_test
 from stock_notifier.scoring.service import score_signal, seed_starter_signals
 
 st.set_page_config(page_title="Stock Signal Notifier", layout="wide")
@@ -256,7 +257,93 @@ def _render_signal_builder() -> None:
         st.dataframe(latest_scores, use_container_width=True, hide_index=True)
 
 
-market_tab, builder_tab, health_tab = st.tabs(["Market data", "Signal Builder", "Pipeline health"])
+def _render_notifications() -> None:
+    st.subheader("Notifications")
+    st.caption("Telegram alert delivery based on saved signal scores.")
+
+    configured = bool(settings.telegram_bot_token and settings.telegram_chat_id)
+    status_columns = st.columns(4)
+    status_columns[0].metric("Telegram token", "Configured" if settings.telegram_bot_token else "Missing")
+    status_columns[1].metric("Telegram chat", "Configured" if settings.telegram_chat_id else "Missing")
+    status_columns[2].metric("Dry run", "On" if settings.alert_dry_run else "Off")
+    status_columns[3].metric("Cooldown", f"{settings.alert_cooldown_hours:g}h")
+
+    if not configured:
+        st.warning(
+            "Telegram is not fully configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in `.env`."
+        )
+
+    action_left, action_middle, action_right = st.columns(3)
+    with action_left:
+        if st.button("Seed alert rules", use_container_width=True):
+            count = seed_alert_rules(database, settings)
+            st.success(f"Seeded/updated {count} alert rules.")
+            st.cache_data.clear()
+            st.rerun()
+    with action_middle:
+        if st.button("Send Telegram test", use_container_width=True):
+            sent = send_telegram_test(database, settings)
+            if settings.alert_dry_run:
+                st.info("Recorded Telegram test as dry-run. Set ALERT_DRY_RUN=false to send.")
+            elif sent:
+                st.success("Telegram test delivered.")
+            else:
+                st.error("Telegram test failed. Check delivery history.")
+            st.cache_data.clear()
+    with action_right:
+        if st.button("Run alert scan", use_container_width=True):
+            result = scan_alerts(database, settings)
+            st.success(
+                "Alert scan complete: "
+                f"{result.alerts_created} alerts, {result.deliveries_attempted} deliveries, "
+                f"dry_run={result.dry_run}"
+            )
+            st.cache_data.clear()
+
+    st.markdown("#### Alert rules")
+    rules = read_frame(
+        """
+        SELECT signal_name, enabled, buy_threshold, sell_threshold, cooldown_hours, updated_at
+        FROM alert_rules ORDER BY signal_name
+        """
+    )
+    if rules.empty:
+        st.info("No alert rules yet. Seed rules after creating/scoring signals.")
+    else:
+        st.dataframe(rules, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Recent alerts")
+    alerts = read_frame(
+        """
+        SELECT created_at, direction, symbol, signal_name, score, threshold,
+               trading_date, close, message
+        FROM alerts ORDER BY id DESC LIMIT 50
+        """
+    )
+    if alerts.empty:
+        st.info("No generated alerts yet.")
+    else:
+        st.dataframe(alerts, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Delivery history")
+    deliveries = read_frame(
+        """
+        SELECT d.created_at, d.channel_type, d.status, d.alert_id,
+               a.symbol, a.direction, a.signal_name, d.error_text
+        FROM notification_deliveries d
+        LEFT JOIN alerts a ON a.id=d.alert_id
+        ORDER BY d.id DESC LIMIT 50
+        """
+    )
+    if deliveries.empty:
+        st.info("No notification deliveries yet.")
+    else:
+        st.dataframe(deliveries, use_container_width=True, hide_index=True)
+
+
+market_tab, builder_tab, notifications_tab, health_tab = st.tabs(
+    ["Market data", "Signal Builder", "Notifications", "Pipeline health"]
+)
 
 with market_tab:
     latest = _latest_watchlist()
@@ -299,6 +386,9 @@ with market_tab:
 
 with builder_tab:
     _render_signal_builder()
+
+with notifications_tab:
+    _render_notifications()
 
 with health_tab:
     st.subheader("Pipeline health")

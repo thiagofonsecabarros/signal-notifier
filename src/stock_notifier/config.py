@@ -16,6 +16,13 @@ class Settings:
     requests_per_minute: int = 5
     http_timeout_seconds: float = 30.0
     log_level: str = "INFO"
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    dashboard_base_url: str = ""
+    alert_default_buy_threshold: float = 75.0
+    alert_default_sell_threshold: float = 40.0
+    alert_cooldown_hours: float = 12.0
+    alert_dry_run: bool = True
 
     @classmethod
     def from_env(cls, *, require_api_key: bool = True) -> Settings:
@@ -31,5 +38,12 @@ class Settings:
             requests_per_minute=int(os.getenv("MASSIVE_REQUESTS_PER_MINUTE", "5")),
             http_timeout_seconds=float(os.getenv("MASSIVE_HTTP_TIMEOUT_SECONDS", "30")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            dashboard_base_url=os.getenv("DASHBOARD_BASE_URL", "").strip().rstrip("/"),
+            alert_default_buy_threshold=float(os.getenv("ALERT_DEFAULT_BUY_THRESHOLD", "75")),
+            alert_default_sell_threshold=float(os.getenv("ALERT_DEFAULT_SELL_THRESHOLD", "40")),
+            alert_cooldown_hours=float(os.getenv("ALERT_COOLDOWN_HOURS", "12")),
+            alert_dry_run=os.getenv("ALERT_DRY_RUN", "true").strip().lower()
+            in {"1", "true", "yes", "y", "on"},
         )
-

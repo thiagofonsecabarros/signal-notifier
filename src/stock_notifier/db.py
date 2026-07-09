@@ -103,6 +103,67 @@ CREATE TABLE IF NOT EXISTS signal_score_components (
     contribution REAL NOT NULL,
     message TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS notification_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_type TEXT NOT NULL,
+    name TEXT NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    config_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id INTEGER REFERENCES signal_definitions(id),
+    signal_name TEXT NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    buy_threshold REAL NOT NULL DEFAULT 75,
+    sell_threshold REAL NOT NULL DEFAULT 40,
+    cooldown_hours REAL NOT NULL DEFAULT 12,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_rule_id INTEGER REFERENCES alert_rules(id),
+    signal_id INTEGER REFERENCES signal_definitions(id),
+    signal_name TEXT NOT NULL,
+    symbol TEXT NOT NULL REFERENCES symbols(ticker),
+    direction TEXT NOT NULL CHECK (direction IN ('BUY', 'SELL')),
+    score REAL NOT NULL,
+    threshold REAL NOT NULL,
+    trading_date TEXT,
+    close REAL,
+    message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id INTEGER REFERENCES alerts(id) ON DELETE CASCADE,
+    channel_type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('dry_run', 'delivered', 'failed')),
+    request_json TEXT NOT NULL DEFAULT '{}',
+    response_json TEXT NOT NULL DEFAULT '{}',
+    error_text TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_state (
+    signal_name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('BUY', 'SELL')),
+    last_score REAL,
+    last_alerted_at TEXT,
+    last_alert_id INTEGER REFERENCES alerts(id),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (signal_name, symbol, direction)
+);
 """
 
 
@@ -406,6 +467,272 @@ class Database:
                 )
                 count += 1
         return count
+
+    def upsert_notification_channel(
+        self,
+        name: str,
+        *,
+        channel_type: str = "telegram",
+        enabled: bool = True,
+        config: dict[str, Any] | None = None,
+    ) -> int:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO notification_channels(
+                    channel_type, name, enabled, config_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    channel_type=excluded.channel_type,
+                    enabled=excluded.enabled,
+                    config_json=excluded.config_json,
+                    updated_at=excluded.updated_at
+                RETURNING id
+                """,
+                (
+                    channel_type,
+                    name,
+                    1 if enabled else 0,
+                    json.dumps(config or {}, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.fetchone()[0])
+
+    def seed_alert_rules(
+        self,
+        *,
+        buy_threshold: float,
+        sell_threshold: float,
+        cooldown_hours: float,
+    ) -> int:
+        now = datetime.now(UTC).isoformat()
+        definitions = self.list_signal_definitions(enabled_only=True)
+        with self.connect() as connection:
+            for definition in definitions:
+                connection.execute(
+                    """
+                    INSERT INTO alert_rules(
+                        signal_id, signal_name, enabled, buy_threshold, sell_threshold,
+                        cooldown_hours, created_at, updated_at
+                    )
+                    VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                    ON CONFLICT(signal_name) DO UPDATE SET
+                        signal_id=excluded.signal_id,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        definition["id"],
+                        definition["name"],
+                        buy_threshold,
+                        sell_threshold,
+                        cooldown_hours,
+                        now,
+                        now,
+                    ),
+                )
+        return len(definitions)
+
+    def list_alert_rules(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        sql = """
+            SELECT id, signal_id, signal_name, enabled, buy_threshold, sell_threshold,
+                   cooldown_hours, created_at, updated_at
+            FROM alert_rules
+        """
+        if enabled_only:
+            sql += " WHERE enabled=1"
+        sql += " ORDER BY signal_name"
+        return [dict(row) for row in self.query(sql)]
+
+    def latest_scores_for_alert_rules(self) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT
+                r.id AS alert_rule_id,
+                r.signal_id,
+                r.signal_name,
+                r.buy_threshold,
+                r.sell_threshold,
+                r.cooldown_hours,
+                s.id AS score_id,
+                s.symbol,
+                s.trading_date,
+                s.close,
+                s.score,
+                s.eligible,
+                s.message AS score_message,
+                s.created_at AS scored_at
+            FROM alert_rules r
+            JOIN signal_scores s
+              ON lower(s.signal_name)=lower(r.signal_name)
+             AND s.is_latest=1
+            WHERE r.enabled=1
+            ORDER BY r.signal_name, s.score DESC
+            """
+        )
+        return [dict(row) for row in rows]
+
+    def score_components_for_score(self, score_id: int) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT component_name, component_type, mode, value, passed,
+                   component_score, weight, contribution, message
+            FROM signal_score_components
+            WHERE score_id=?
+            ORDER BY id
+            """,
+            (score_id,),
+        )
+        return [dict(row) for row in rows]
+
+    def get_alert_state(self, signal_name: str, symbol: str, direction: str) -> dict[str, Any] | None:
+        rows = self.query(
+            """
+            SELECT signal_name, symbol, direction, last_score, last_alerted_at,
+                   last_alert_id, updated_at
+            FROM alert_state
+            WHERE signal_name=? AND symbol=? AND direction=?
+            """,
+            (signal_name, symbol, direction),
+        )
+        return dict(rows[0]) if rows else None
+
+    def upsert_alert_state(
+        self,
+        *,
+        signal_name: str,
+        symbol: str,
+        direction: str,
+        last_score: float,
+        last_alerted_at: str | None = None,
+        last_alert_id: int | None = None,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO alert_state(
+                    signal_name, symbol, direction, last_score, last_alerted_at,
+                    last_alert_id, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(signal_name, symbol, direction) DO UPDATE SET
+                    last_score=excluded.last_score,
+                    last_alerted_at=COALESCE(excluded.last_alerted_at, alert_state.last_alerted_at),
+                    last_alert_id=COALESCE(excluded.last_alert_id, alert_state.last_alert_id),
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    signal_name,
+                    symbol,
+                    direction,
+                    last_score,
+                    last_alerted_at,
+                    last_alert_id,
+                    now,
+                ),
+            )
+
+    def create_alert(
+        self,
+        *,
+        alert_rule_id: int,
+        signal_id: int | None,
+        signal_name: str,
+        symbol: str,
+        direction: str,
+        score: float,
+        threshold: float,
+        trading_date: str | None,
+        close: float | None,
+        message: str,
+    ) -> int:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO alerts(
+                    alert_rule_id, signal_id, signal_name, symbol, direction,
+                    score, threshold, trading_date, close, message, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    alert_rule_id,
+                    signal_id,
+                    signal_name,
+                    symbol,
+                    direction,
+                    score,
+                    threshold,
+                    trading_date,
+                    close,
+                    message,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def record_notification_delivery(
+        self,
+        *,
+        alert_id: int | None,
+        channel_type: str,
+        status: str,
+        request: dict[str, Any] | None = None,
+        response: dict[str, Any] | None = None,
+        error_text: str = "",
+    ) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO notification_deliveries(
+                    alert_id, channel_type, status, request_json, response_json,
+                    error_text, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    alert_id,
+                    channel_type,
+                    status,
+                    json.dumps(request or {}, sort_keys=True),
+                    json.dumps(response or {}, sort_keys=True),
+                    error_text[:2000],
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def recent_alerts(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT id, created_at, signal_name, symbol, direction, score, threshold,
+                   trading_date, close, message
+            FROM alerts
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+    def recent_notification_deliveries(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT d.id, d.created_at, d.alert_id, a.signal_name, a.symbol, a.direction,
+                   d.channel_type, d.status, d.error_text
+            FROM notification_deliveries d
+            LEFT JOIN alerts a ON a.id=d.alert_id
+            ORDER BY d.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _signal_definition_from_row(row: sqlite3.Row) -> dict[str, Any]:

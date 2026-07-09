@@ -7,6 +7,11 @@ from datetime import date, timedelta
 from stock_notifier.config import Settings
 from stock_notifier.db import Database
 from stock_notifier.ingest import backfill_symbols, fetch_grouped_with_lookback
+from stock_notifier.notifications.service import (
+    scan_alerts,
+    seed_alert_rules,
+    send_telegram_test,
+)
 from stock_notifier.providers.massive import MassiveClient
 from stock_notifier.scoring.service import score_enabled_signals, score_signal, seed_starter_signals
 from stock_notifier.symbols import load_symbols
@@ -36,6 +41,18 @@ def _parser() -> argparse.ArgumentParser:
     score.add_argument("--no-store", action="store_true", help="Preview without saving scores")
 
     subparsers.add_parser("score-all", help="Run every enabled saved signal definition")
+
+    telegram_test = subparsers.add_parser("telegram-test", help="Send a Telegram test message")
+    telegram_test.add_argument("--dry-run", action="store_true", help="Record the test without sending")
+
+    subparsers.add_parser("alert-rules-seed", help="Create default alert rules for enabled signals")
+
+    alerts_scan = subparsers.add_parser("alerts-scan", help="Scan latest signal scores for alerts")
+    alerts_scan.add_argument("--dry-run", action="store_true", help="Record deliveries without sending")
+    alerts_scan.add_argument("--send", action="store_true", help="Force real sending even if ALERT_DRY_RUN=true")
+
+    alerts_history = subparsers.add_parser("alerts-history", help="Show recent generated alerts")
+    alerts_history.add_argument("--limit", type=int, default=20)
     return parser
 
 
@@ -115,6 +132,35 @@ def main() -> None:
         results = score_enabled_signals(database)
         total = sum(len(items) for items in results.values())
         print(f"Scored {total} symbol/signal rows across {len(results)} signals")
+    elif args.command == "telegram-test":
+        sent = send_telegram_test(database, settings, dry_run=True if args.dry_run else None)
+        if settings.alert_dry_run or args.dry_run:
+            print("Recorded Telegram test in dry-run mode")
+        else:
+            print("Telegram test delivered" if sent else "Telegram test failed; check delivery history")
+            if not sent:
+                raise SystemExit(2)
+    elif args.command == "alert-rules-seed":
+        count = seed_alert_rules(database, settings)
+        print(f"Seeded/updated {count} alert rules")
+    elif args.command == "alerts-scan":
+        dry_run = True if args.dry_run else False if args.send else None
+        result = scan_alerts(database, settings, dry_run=dry_run)
+        print(
+            "Alert scan complete: "
+            f"evaluated={result.evaluated}, alerts={result.alerts_created}, "
+            f"deliveries={result.deliveries_attempted}, delivered={result.delivered}, "
+            f"dry_run={result.dry_run}"
+        )
+    elif args.command == "alerts-history":
+        alerts = database.recent_alerts(limit=args.limit)
+        if not alerts:
+            print("No alerts yet.")
+        for alert in alerts:
+            print(
+                f"{alert['id']}: {alert['created_at']} {alert['direction']} "
+                f"{alert['symbol']} {alert['signal_name']} score={alert['score']:.2f}"
+            )
 
 
 if __name__ == "__main__":
