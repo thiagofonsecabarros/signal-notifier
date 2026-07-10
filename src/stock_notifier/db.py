@@ -274,6 +274,31 @@ CREATE TABLE IF NOT EXISTS scan_cycle_runs (
     duration_seconds REAL NOT NULL DEFAULT 0,
     message TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS service_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_name TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL CHECK (status IN ('running', 'success', 'partial', 'failed', 'cancelled')),
+    requested_count INTEGER NOT NULL DEFAULT 0,
+    processed_count INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    error_count INTEGER NOT NULL DEFAULT 0,
+    duration_seconds REAL NOT NULL DEFAULT 0,
+    message TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_runs_started
+ON service_runs(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -334,6 +359,28 @@ class Database:
                 rows,
             )
         return len(rows)
+
+    def get_app_setting(self, key: str, default: Any = None) -> Any:
+        rows = self.query("SELECT value_json FROM app_settings WHERE key=?", (key,))
+        if not rows:
+            return default
+        try:
+            return json.loads(str(rows[0]["value_json"]))
+        except json.JSONDecodeError:
+            return default
+
+    def set_app_setting(self, key: str, value: Any) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO app_settings(key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                (key, json.dumps(value), datetime.now(UTC).isoformat()),
+            )
 
     def ensure_symbols(self, tickers: Iterable[str]) -> int:
         now = datetime.now(UTC).isoformat()
@@ -725,7 +772,33 @@ class Database:
                 """,
                 rows,
             )
+            connection.execute(
+                "UPDATE symbol_lists SET updated_at=? WHERE id=?",
+                (now, list_id),
+            )
         return len(rows)
+
+    def replace_symbols_in_list(self, list_id: int, symbols: Iterable[str]) -> int:
+        requested = sorted({symbol.upper().strip() for symbol in symbols if symbol.strip()})
+        if requested:
+            self.ensure_symbols(requested)
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute("DELETE FROM symbol_list_members WHERE list_id=?", (list_id,))
+            if requested:
+                rows = [(list_id, symbol, now) for symbol in requested]
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO symbol_list_members(list_id, symbol, added_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    rows,
+                )
+            connection.execute(
+                "UPDATE symbol_lists SET updated_at=? WHERE id=?",
+                (now, list_id),
+            )
+        return len(requested)
 
     def remove_symbol_from_list(self, list_id: int, symbol: str) -> None:
         with self.connect() as connection:
@@ -1390,6 +1463,70 @@ class Database:
                    symbols_filtered, symbols_scored, alerts_created,
                    deliveries_attempted, delivered, duration_seconds, message
             FROM scan_cycle_runs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+    def start_service_run(
+        self,
+        service_name: str,
+        *,
+        scope: str = "",
+        requested_count: int = 0,
+    ) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO service_runs(service_name, scope, started_at, status, requested_count)
+                VALUES (?, ?, ?, 'running', ?)
+                """,
+                (service_name, scope[:500], datetime.now(UTC).isoformat(), requested_count),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_service_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        processed_count: int = 0,
+        success_count: int = 0,
+        skipped_count: int = 0,
+        error_count: int = 0,
+        duration_seconds: float = 0.0,
+        message: str = "",
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE service_runs
+                SET finished_at=?, status=?, processed_count=?, success_count=?,
+                    skipped_count=?, error_count=?, duration_seconds=?, message=?
+                WHERE id=?
+                """,
+                (
+                    datetime.now(UTC).isoformat(),
+                    status,
+                    processed_count,
+                    success_count,
+                    skipped_count,
+                    error_count,
+                    duration_seconds,
+                    message[:2000],
+                    run_id,
+                ),
+            )
+
+    def recent_service_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT service_name, scope, started_at, finished_at, status,
+                   requested_count, processed_count, success_count,
+                   skipped_count, error_count, duration_seconds, message
+            FROM service_runs
             ORDER BY id DESC
             LIMIT ?
             """,

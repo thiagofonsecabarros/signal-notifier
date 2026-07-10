@@ -44,7 +44,7 @@ On the Oracle VM:
 ```text
 Caddy :80/:443 ──► Streamlit 127.0.0.1:8501
 systemd timer    ──► scheduled fetch/scan cycle
-SQLite           ──► /opt/stock-notifier/data/stock_notifier.db
+SQLite           ──► SERVER_DB_FILEPATH
 ```
 
 ## Repository layout
@@ -87,8 +87,8 @@ Core variables:
 
 ```env
 MASSIVE_API_KEY=your_massive_api_key_here
-DB_PATH=/opt/stock-notifier/data/stock_notifier.db
-SYMBOLS_PATH=/opt/stock-notifier/config/symbols.txt
+DB_PATH=SERVER_DB_FILEPATH
+SYMBOLS_PATH=SERVER_SYMBOLS_FILEPATH
 MASSIVE_BASE_URL=https://api.massive.com
 MASSIVE_REQUESTS_PER_MINUTE=5
 MASSIVE_PROFILE_REQUESTS_PER_MINUTE=120
@@ -120,7 +120,7 @@ SCAN_MAX_SYMBOLS=500
 SCAN_MIN_PRICE=5
 SCAN_MIN_DAY_VOLUME=500000
 SCAN_MARKET_HOURS_ONLY=true
-SCAN_LOCK_PATH=/opt/stock-notifier/data/scan-cycle.lock
+SCAN_LOCK_PATH=SERVER_SCAN_LOCK_FILEPATH
 ```
 
 Dashboard variables:
@@ -133,7 +133,7 @@ DASHBOARD_PORT=8501
 For the current Oracle IP deployment, the private server `.env` can use:
 
 ```env
-DASHBOARD_BASE_URL=http://YOUR_SERVER_IP
+DASHBOARD_BASE_URL=http://SERVER_HOST_OR_DOMAIN
 ```
 
 ## Local setup
@@ -141,7 +141,7 @@ DASHBOARD_BASE_URL=http://YOUR_SERVER_IP
 From Windows PowerShell:
 
 ```powershell
-cd "L:\Signal Notifier"
+cd "PROJECT_ROOT"
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install --upgrade pip
@@ -193,6 +193,25 @@ stock-notifier backfill --days 90 --symbols AAPL,MSFT,SPY
 
 Some snapshot symbols, especially preferred/share-class tickers, may not have a Massive ticker-overview profile. `sync-profiles` records those as unavailable placeholders so they are not retried in every batch.
 
+The dashboard **Services** tab provides safer data-ingestion workflows for larger scopes.
+
+Market snapshot ingestion:
+
+- uses Massive's full-market snapshot endpoint;
+- stores lightweight fields: last price, change %, previous close, volume, and dollar volume;
+- can run for the full stock universe, selected lists, typed tickers, or lists plus typed tickers;
+- supports minimum price, volume, dollar-volume, and max-symbol filters;
+- is the preferred first step before heavier enrichment jobs.
+
+Company profile ingestion:
+
+- choose `Stocks universe`, selected lists, typed tickers, or lists plus typed tickers;
+- run only missing profiles or refresh all selected profiles;
+- choose chunk size and requests/minute;
+- run the next chunk, preserving anything already loaded.
+
+For the full stock universe, market snapshots are fast enough to run frequently. Company profiles are slower because they require one ticker-overview request per symbol; prefer repeated chunks or an overnight server job instead of one huge blocking dashboard run.
+
 Signal scoring:
 
 ```powershell
@@ -232,10 +251,11 @@ full-market snapshot → price/volume filters → score enabled signals → sche
 The Streamlit dashboard currently includes:
 
 - **Market data** — Stocks universe/list view selector, searchable symbol/company lookup, range selector, aligned price and volume chart.
-- **Lists** — create, rename, describe, populate, prune, and delete reusable stock lists.
+- **Lists** — full-width list workspace with existing-list table, create/manage selector, manual ticker management, and signal-derived list creation.
 - **Signal Builder** — configurable technical-signal definitions stored in SQLite, with inline component help, examples, and universe selection by lists/tickers.
-- **Notifications** — Telegram configuration status, editable scheduled alert rules, pending alerts, recent alerts, and delivery history.
-- **Pipeline health** — fetch logs, signal-run history, and scan-cycle history.
+- **Notifications** — Telegram configuration status, missing-rule prompts for newly created signals, editable scheduled alert rules, pending alerts, recent alerts, and delivery history.
+- **Services** — bounded maintenance/data-ingestion actions, including market snapshots and chunked company-profile ingestion for the stock universe, selected lists, or typed tickers.
+- **Latest runs** — fetch logs, signal-run history, service-run history, and scan-cycle history.
 
 The Signal Builder supports weighted score components and hard gate/filter components. Current component types include:
 
@@ -265,13 +285,22 @@ The dashboard has a dedicated **Lists** tab. Use it to create reusable groups su
 - `High conviction`
 - `AI stocks`
 - `Energy watch`
+- `Liquid Universe`
 
-You can create lists, rename them, edit descriptions, add comma-separated tickers, search the stock universe for close matches, remove members, or delete an entire list.
+The Lists tab is organized as a full-width workspace:
+
+1. **Existing lists** — table of all saved lists, descriptions, counts, and timestamps.
+2. **Create/Manage Lists** — dropdown with `Create New List` plus every existing list.
+3. **List details** — rename and edit description for the selected list.
+4. **Add symbols** — add comma-separated tickers, add the currently selected Market Data chart symbol, or search the stock universe by ticker/company name.
+5. **Members** — view current list members and remove individual tickers.
+6. **Create or update a list from a signal** — turn a saved signal into a reusable list.
+7. **Danger zone** — delete the selected list.
 
 The **Market data** tab lets you choose a single view with checkbox-style selectors:
 
 - **Stocks universe** — the full active stock universe currently in the database.
-- Any custom list you created, such as `Portfolio` or `Potential`.
+- Any custom list you created, such as `Portfolio`, `Potential`, or `Liquid Universe`.
 
 Only one Market Data view is active at a time. The table, symbol search, and chart selector all use the selected view.
 
@@ -284,6 +313,49 @@ Extra selected tickers: NVDA, MSFT
 ```
 
 The signal will run only on the union of the selected lists and extra tickers. If a scan cycle also passes a filtered symbol set, the signal uses the intersection so VM-safe scan filters still apply.
+
+### Build lists from signals
+
+The Lists tab can create or update a list from any saved signal. This is useful when a signal is mostly a set of gates/filters and you want the passing symbols to become a reusable universe.
+
+Typical use cases:
+
+- `Liquid Universe` — symbols passing minimum dollar-volume or latest-volume gates.
+- `Momentum Candidates` — liquid symbols passing momentum/trend gates.
+- `Trend Watch` — symbols with close above key moving averages and ADX above a threshold.
+
+Workflow:
+
+1. Create and save a signal in **Signal Builder**.
+2. Go to **Lists**.
+3. Open **Create or update a list from a signal**.
+4. Choose the saved signal.
+5. Choose `Create new list` or `Use existing list`.
+6. Choose candidate source:
+   - `Market snapshot by dollar volume` — faster and safer for broad scans; uses the latest snapshot and scores only the top filtered candidates.
+   - `Signal universe` — follows the signal's own selected lists/tickers or all active symbols if no selected universe is configured.
+7. Choose filters such as `Eligible only`, minimum score, and max symbols.
+8. Choose whether to replace existing list members or append to the list.
+9. Click **Build list from signal**.
+
+For a liquidity list, create a signal with a liquidity gate:
+
+```text
+Type: Dollar volume
+Mode: gate
+Op: >=
+Threshold: 100000
+```
+
+Then use **Lists → Create or update a list from a signal** to build a list such as `Liquid Universe`. Use `Market snapshot by dollar volume` as the candidate source and keep `Eligible only` checked.
+
+For the small Oracle E2.1.Micro VM, prefer this staged workflow:
+
+```text
+Market snapshot → liquidity signal/list → backfill liquid list → score/alert liquid list
+```
+
+This avoids trying to score or backfill every ticker at once.
 
 ## Signal Builder guide
 
@@ -563,15 +635,15 @@ fetch-daily → score-all → alerts-scan → Telegram
 SSH key location currently used:
 
 ```powershell
-$KEY = "L:\ssh-oracle\ssh-key-2026-07-06.key"
-$SERVER = "ubuntu@YOUR_SERVER_IP"
+$KEY = "KEY_FILEPATH"
+$SERVER = "SERVER_HOST"
 ssh -i $KEY $SERVER
 ```
 
 On the server:
 
 ```bash
-cd /opt/stock-notifier
+cd SERVER_PROJECT_DIR
 source .venv/bin/activate
 ```
 
@@ -612,14 +684,128 @@ journalctl -u stock-notifier-fetch.service -n 100 --no-pager
 Edit server `.env`:
 
 ```bash
-nano /opt/stock-notifier/.env
+nano SERVER_ENV_FILEPATH
 ```
 
 Lock down server secrets:
 
 ```bash
-sudo chown ubuntu:ubuntu /opt/stock-notifier/.env
-chmod 600 /opt/stock-notifier/.env
+sudo chown ubuntu:ubuntu SERVER_ENV_FILEPATH
+chmod 600 SERVER_ENV_FILEPATH
+```
+
+## Cloud rollout and backfill procedure
+
+Recommended order:
+
+```text
+deploy code → run init-db/migrations → verify dashboard/CLI → ingest/backfill data
+```
+
+Do **not** backfill a large database first and then upload code that may require schema changes. Code and schema should go first, because `stock-notifier init-db` creates/upgrades the tables needed by the current version.
+
+Use this default path for normal changes:
+
+1. Deploy local code changes to the Oracle server.
+2. SSH into the server.
+
+   ```powershell
+   ssh -i "KEY_FILEPATH" SERVER_HOST
+   ```
+
+3. Run:
+
+   ```bash
+   cd SERVER_PROJECT_DIR
+   source .venv/bin/activate
+   stock-notifier init-db
+   ```
+
+4. Restart the dashboard:
+
+   ```bash
+   sudo systemctl restart stock-notifier-dashboard.service
+   ```
+
+5. Run lightweight ingestion first:
+
+   ```bash
+   stock-notifier run-scan-cycle --dry-run --benchmark --max-symbols 50
+   ```
+
+   Or use the dashboard:
+
+   ```text
+   Services → Data ingestion: market snapshot
+   ```
+
+6. Backfill only the symbols you need for signal testing:
+
+   ```bash
+   stock-notifier backfill --days 320 --symbols AAPL,MSFT,NVDA,SPY,QQQ
+   stock-notifier score-all
+   stock-notifier alerts-scan --dry-run
+   ```
+
+7. Expand gradually:
+
+   - lists first, such as `Portfolio` or `Potential`;
+   - then filtered/liquid symbols from market snapshots;
+   - only later, broad/full-universe historical backfills.
+
+### When to backfill locally vs on the cloud server
+
+Prefer **cloud/server backfill** when:
+
+- the Oracle server is already configured and stable;
+- the backfill is modest, such as 50–500 symbols;
+- you want the production database to be built directly in `SERVER_DATA_DIR`;
+- you want to avoid copying a large SQLite file over SSH.
+
+Prefer **local backfill then upload the SQLite DB** when:
+
+- you are backfilling a large amount of history;
+- your local computer is faster and can run for a long time;
+- you want to test the database locally before replacing the server DB;
+- the Oracle E2.1.Micro is too slow for the initial historical load.
+
+If uploading a local DB, stop the dashboard first so SQLite is not being read while the file is replaced:
+
+```bash
+sudo systemctl stop stock-notifier-dashboard.service
+cp SERVER_DB_FILEPATH SERVER_DB_FILEPATH.bak
+```
+
+From local PowerShell:
+
+```powershell
+$KEY = "KEY_FILEPATH"
+$SERVER = "SERVER_HOST"
+scp -i $KEY "DB_FILEPATH" "${SERVER}:SERVER_DB_FILEPATH"
+```
+
+Then on the server:
+
+```bash
+cd SERVER_PROJECT_DIR
+source .venv/bin/activate
+stock-notifier init-db
+sudo systemctl start stock-notifier-dashboard.service
+```
+
+Only replace the server DB intentionally. The database contains saved signal definitions, lists, scores, alerts, and notification history, so uploading a local DB can overwrite server-created data.
+
+### Practical recommendation right now
+
+For the current project stage:
+
+```text
+1. Upload/deploy the latest code first.
+2. Run stock-notifier init-db on the server.
+3. Use Services → Market snapshot to populate lightweight price/volume data.
+4. Backfill 250–320 days only for lists or symbols you plan to score.
+5. Run score-all and alerts-scan --dry-run.
+6. Add larger historical backfills later, preferably as an overnight/background service.
 ```
 
 ## Deploy local code changes to Oracle
@@ -627,25 +813,22 @@ chmod 600 /opt/stock-notifier/.env
 From local Windows PowerShell:
 
 ```powershell
-$KEY = "L:\ssh-oracle\ssh-key-2026-07-06.key"
-$SERVER = "ubuntu@YOUR_SERVER_IP"
+$KEY = "KEY_FILEPATH"
+$SERVER = "SERVER_HOST"
+$LOCAL = "PROJECT_ROOT"
+$REMOTE = "SERVER_PROJECT_DIR"
 ```
 
 Copy changed source files:
 
 ```powershell
-scp -i $KEY -r "L:\Signal Notifier\src\stock_notifier\scoring" "${SERVER}:/opt/stock-notifier/src/stock_notifier/"
-scp -i $KEY -r "L:\Signal Notifier\src\stock_notifier\notifications" "${SERVER}:/opt/stock-notifier/src/stock_notifier/"
-scp -i $KEY "L:\Signal Notifier\src\stock_notifier\config.py" "${SERVER}:/opt/stock-notifier/src/stock_notifier/config.py"
-scp -i $KEY "L:\Signal Notifier\src\stock_notifier\db.py" "${SERVER}:/opt/stock-notifier/src/stock_notifier/db.py"
-scp -i $KEY "L:\Signal Notifier\src\stock_notifier\cli.py" "${SERVER}:/opt/stock-notifier/src/stock_notifier/cli.py"
-scp -i $KEY "L:\Signal Notifier\src\stock_notifier\dashboard.py" "${SERVER}:/opt/stock-notifier/src/stock_notifier/dashboard.py"
+scp -i $KEY -r "$LOCAL\src\stock_notifier" "${SERVER}:${REMOTE}/src/"
 ```
 
 Then on the server:
 
 ```bash
-cd /opt/stock-notifier
+cd SERVER_PROJECT_DIR
 source .venv/bin/activate
 python -m py_compile src/stock_notifier/*.py src/stock_notifier/scoring/*.py src/stock_notifier/notifications/*.py
 stock-notifier init-db
@@ -682,6 +865,8 @@ Current SQLite schema includes:
 - `notification_deliveries`
 - `alert_state`
 - `pending_alerts`
+- `service_runs`
+- `app_settings`
 - `scan_cycle_runs`
 
 `company_profiles` stores Massive ticker overview metadata such as name, primary exchange, market cap, SIC code, and SIC description. Start with SIC description as the first industry classification; richer sector mapping can be added later.
@@ -691,7 +876,7 @@ Current SQLite schema includes:
 Run from local PowerShell:
 
 ```powershell
-cd "L:\Signal Notifier"
+cd "PROJECT_ROOT"
 .\.venv\Scripts\Activate.ps1
 pytest -q
 ```
@@ -734,4 +919,4 @@ Likely future cost:
 
 ---
 
-Last updated: 2026-07-09.
+Last updated: 2026-07-10.

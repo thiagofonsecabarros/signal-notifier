@@ -31,6 +31,42 @@ def test_fetch_log_lifecycle(tmp_path):
     assert row["bars_written"] == 1
 
 
+def test_service_run_lifecycle(tmp_path):
+    database = Database(tmp_path / "notifier.db")
+    database.initialize()
+    run_id = database.start_service_run("market_snapshot", scope="Stocks universe", requested_count=10)
+    database.finish_service_run(
+        run_id,
+        status="success",
+        processed_count=10,
+        success_count=8,
+        skipped_count=2,
+        duration_seconds=1.5,
+        message="stored=8",
+    )
+
+    row = database.recent_service_runs(limit=1)[0]
+    assert row["service_name"] == "market_snapshot"
+    assert row["scope"] == "Stocks universe"
+    assert row["status"] == "success"
+    assert row["requested_count"] == 10
+    assert row["processed_count"] == 10
+    assert row["success_count"] == 8
+    assert row["skipped_count"] == 2
+
+
+def test_app_settings_round_trip(tmp_path):
+    database = Database(tmp_path / "notifier.db")
+    database.initialize()
+
+    assert database.get_app_setting("missing", {"default": True}) == {"default": True}
+    database.set_app_setting("services.snapshot.defaults", {"min_price": 5.0, "lists": ["Portfolio"]})
+    assert database.get_app_setting("services.snapshot.defaults") == {
+        "min_price": 5.0,
+        "lists": ["Portfolio"],
+    }
+
+
 def test_company_profile_upsert_stores_sic_description(tmp_path):
     database = Database(tmp_path / "notifier.db")
     database.initialize()
