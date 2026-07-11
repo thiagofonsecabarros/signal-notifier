@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import date, timedelta
 
 import altair as alt
 import pandas as pd
@@ -228,6 +229,110 @@ def _sync_profile_chunk(symbols: list[str], *, requests_per_minute: int) -> dict
         "unavailable": unavailable,
         "errors": errors,
         "duration": duration,
+    }
+
+
+def _historical_bar_counts(symbols: list[str], start: date, end: date) -> dict[str, int]:
+    if not symbols:
+        return {}
+    placeholders = ", ".join("?" for _ in symbols)
+    rows = database.query(
+        f"""
+        SELECT symbol, COUNT(*) AS bar_count
+        FROM daily_bars
+        WHERE symbol IN ({placeholders})
+          AND trading_date >= ?
+          AND trading_date <= ?
+        GROUP BY symbol
+        """,
+        tuple(symbols) + (start.isoformat(), end.isoformat()),
+    )
+    counts = {str(row["symbol"]): int(row["bar_count"] or 0) for row in rows}
+    return {symbol: counts.get(symbol, 0) for symbol in symbols}
+
+
+def _historical_progress_frame(symbols: list[str], start: date, end: date, expected_bars: int) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    counts = _historical_bar_counts(symbols, start, end)
+    placeholders = ", ".join("?" for _ in symbols)
+    names = read_frame(
+        f"""
+        SELECT s.ticker, COALESCE(NULLIF(p.name, ''), s.name) AS name
+        FROM symbols s
+        LEFT JOIN company_profiles p ON p.ticker=s.ticker
+        WHERE s.ticker IN ({placeholders})
+        ORDER BY s.ticker
+        """,
+        tuple(symbols),
+    )
+    name_map = dict(zip(names.get("ticker", []), names.get("name", []))) if not names.empty else {}
+    return pd.DataFrame(
+        [
+            {
+                "ticker": symbol,
+                "name": name_map.get(symbol, ""),
+                "stored_bars_in_range": counts.get(symbol, 0),
+                "target_bars_estimate": expected_bars,
+                "coverage_pct": round(100.0 * counts.get(symbol, 0) / max(expected_bars, 1), 1),
+            }
+            for symbol in symbols
+        ]
+    )
+
+
+def _sync_historical_symbols(
+    symbols: list[str],
+    *,
+    start: date,
+    end: date,
+    requests_per_minute: int,
+    chunk_size: int,
+) -> dict[str, object]:
+    provider = MassiveClient(
+        settings.massive_api_key,
+        base_url=settings.massive_base_url,
+        requests_per_minute=requests_per_minute,
+        timeout_seconds=settings.http_timeout_seconds,
+    )
+    progress = st.progress(0.0, text="Starting historical data backfill...")
+    status = st.empty()
+    errors: list[dict[str, str]] = []
+    symbols_success = 0
+    bars_written = 0
+    started = time.monotonic()
+    total = len(symbols)
+    chunk_size = max(int(chunk_size), 1)
+    total_chunks = (total + chunk_size - 1) // chunk_size
+
+    for index, symbol in enumerate(symbols, start=1):
+        current_chunk = ((index - 1) // chunk_size) + 1
+        progress.progress(
+            index / max(total, 1),
+            text=(
+                f"Fetching {symbol} ({index}/{total}); "
+                f"chunk {current_chunk}/{total_chunks}"
+            ),
+        )
+        status.caption(f"Current symbol: {symbol}; range {start.isoformat()} to {end.isoformat()}")
+        try:
+            bars = provider.historical_daily(symbol, start, end)
+            database.ensure_symbols([symbol])
+            written = database.upsert_bars(bars)
+            bars_written += written
+            symbols_success += 1
+        except Exception as exc:
+            errors.append({"symbol": symbol, "error": str(exc)})
+
+    duration = time.monotonic() - started
+    progress.progress(1.0, text=f"Historical backfill run complete in {duration:.1f}s")
+    st.cache_data.clear()
+    return {
+        "symbols_success": symbols_success,
+        "bars_written": bars_written,
+        "errors": errors,
+        "duration": duration,
+        "chunks_processed": total_chunks,
     }
 
 
@@ -1619,6 +1724,257 @@ def _render_services() -> None:
                 )
                 st.cache_data.clear()
                 st.error(f"Market snapshot failed: {exc}")
+    with st.expander("Data ingestion: historical data", expanded=False):
+        st.markdown(
+            "Backfill daily historical bars for a selected universe, list, or typed tickers. "
+            "Massive aggregate history is fetched with one API call per symbol for the selected date range, "
+            "then stored in SQLite for Signal Builder indicators such as MA200 and ADX."
+        )
+        if not settings.massive_api_key:
+            st.warning("MASSIVE_API_KEY is missing. Historical data ingestion requires API access.")
+
+        historical_scope_options = ["Stocks universe", "Selected lists", "Typed tickers", "Lists + typed tickers"]
+        historical_scope = st.radio(
+            "Run historical backfill for",
+            historical_scope_options,
+            horizontal=True,
+            key="historical_scope",
+            index=_option_index(
+                historical_scope_options,
+                _app_setting("services.historical.scope", "Selected lists"),
+            ),
+            help="For full-universe history, run in chunks. Lists are usually safer on the small Oracle VM.",
+        )
+        historical_lists: list[str] = []
+        if historical_scope in {"Selected lists", "Lists + typed tickers"}:
+            saved_historical_lists = _app_setting("services.historical.lists", [])
+            historical_lists = st.multiselect(
+                "Historical lists",
+                list_names,
+                key="historical_lists",
+                default=[item for item in saved_historical_lists if item in list_names]
+                if isinstance(saved_historical_lists, list)
+                else [],
+                help="The service will backfill the union of all selected list members.",
+            )
+            if not list_names:
+                st.info("No custom lists yet. Create lists in the Lists tab first.")
+
+        historical_typed_symbols = ""
+        if historical_scope in {"Typed tickers", "Lists + typed tickers"}:
+            historical_typed_symbols = st.text_input(
+                "Historical tickers",
+                placeholder="AAPL, MSFT, NVDA",
+                key="historical_tickers",
+                value=str(_app_setting("services.historical.typed_symbols", "")),
+                help="Comma-separated tickers. These are added to the selected scope.",
+            )
+
+        history_mode_options = ["Only incomplete history", "Refresh selected range"]
+        history_mode = st.radio(
+            "Historical mode",
+            history_mode_options,
+            horizontal=True,
+            key="historical_mode",
+            index=_option_index(
+                history_mode_options,
+                _app_setting("services.historical.mode", "Only incomplete history"),
+            ),
+            help="Incomplete mode skips symbols that already have enough daily bars in the selected range.",
+        )
+        option_cols = st.columns(6)
+        years = option_cols[0].number_input(
+            "Years",
+            min_value=1,
+            max_value=5,
+            value=int(_app_setting("services.historical.years", 1)),
+            step=1,
+            key="historical_years",
+            help="Massive Stock Starter includes up to 5 years of historical data.",
+        )
+        chunk_size = option_cols[1].number_input(
+            "Chunk size",
+            min_value=1,
+            max_value=1000,
+            value=int(_app_setting("services.historical.chunk_size", 50)),
+            step=5,
+            key="historical_chunk_size",
+            help="Progress grouping size. The run can automatically continue across multiple chunks.",
+        )
+        chunks_to_run = option_cols[2].number_input(
+            "Chunks to run",
+            min_value=1,
+            max_value=10000,
+            value=int(_app_setting("services.historical.chunks_to_run", 1)),
+            step=1,
+            key="historical_chunks_to_run",
+            help="How many chunks to process after clicking Run. Increase this to continue automatically.",
+        )
+        requests_per_minute = option_cols[3].number_input(
+            "Requests/minute",
+            min_value=1,
+            max_value=1000,
+            value=int(_app_setting("services.historical.requests_per_minute", settings.profile_requests_per_minute)),
+            step=10,
+            key="historical_requests_per_minute",
+            help="Aggregate-history request pace. Your API plan and VM/network still apply.",
+        )
+        preview_rows = option_cols[4].number_input(
+            "Preview rows",
+            min_value=5,
+            max_value=500,
+            value=int(_app_setting("services.historical.preview_rows", 50)),
+            step=5,
+            key="historical_preview_rows",
+        )
+        coverage_threshold_pct = option_cols[5].number_input(
+            "Complete at %",
+            min_value=50,
+            max_value=100,
+            value=int(_app_setting("services.historical.coverage_threshold_pct", 90)),
+            step=5,
+            key="historical_coverage_threshold_pct",
+            help="A symbol is considered complete when stored bars reach this percentage of expected trading days.",
+        )
+        run_all_remaining = st.checkbox(
+            "Run all remaining chunks automatically",
+            value=bool(_app_setting("services.historical.run_all_remaining", False)),
+            key="historical_run_all_remaining",
+            help="If checked, one click processes every remaining symbol in the selected scope. This can take a long time for thousands of symbols.",
+        )
+
+        end_date = date.today()
+        start_date = end_date - timedelta(days=int(years) * 365)
+        expected_bars = max(int(int(years) * 252), 1)
+        complete_bars = max(int(expected_bars * int(coverage_threshold_pct) / 100), 1)
+
+        historical_defaults: dict[str, object] = {
+            "services.historical.scope": historical_scope,
+            "services.historical.mode": history_mode,
+            "services.historical.years": int(years),
+            "services.historical.chunk_size": int(chunk_size),
+            "services.historical.chunks_to_run": int(chunks_to_run),
+            "services.historical.run_all_remaining": bool(run_all_remaining),
+            "services.historical.requests_per_minute": int(requests_per_minute),
+            "services.historical.preview_rows": int(preview_rows),
+            "services.historical.coverage_threshold_pct": int(coverage_threshold_pct),
+        }
+        if historical_scope in {"Selected lists", "Lists + typed tickers"}:
+            historical_defaults["services.historical.lists"] = historical_lists
+        if historical_scope in {"Typed tickers", "Lists + typed tickers"}:
+            historical_defaults["services.historical.typed_symbols"] = historical_typed_symbols
+        _save_app_settings(historical_defaults)
+
+        scope_symbols = _profile_scope_symbols(
+            scope=historical_scope,
+            selected_lists=historical_lists,
+            typed_symbols=historical_typed_symbols,
+        )
+        bar_counts = _historical_bar_counts(scope_symbols, start_date, end_date)
+        complete_symbols = {symbol for symbol, count in bar_counts.items() if count >= complete_bars}
+        pending_symbols = (
+            [symbol for symbol in scope_symbols if symbol not in complete_symbols]
+            if history_mode == "Only incomplete history"
+            else scope_symbols
+        )
+        chunks_remaining = (len(pending_symbols) + int(chunk_size) - 1) // max(int(chunk_size), 1)
+        run_chunk_count = chunks_remaining if run_all_remaining else min(int(chunks_to_run), chunks_remaining)
+        run_symbol_limit = int(chunk_size) * max(run_chunk_count, 0)
+        symbols_to_run = pending_symbols[:run_symbol_limit]
+
+        total_estimated_calls = len(pending_symbols)
+        estimated_minutes_total = total_estimated_calls / max(int(requests_per_minute), 1)
+        estimated_minutes_run = len(symbols_to_run) / max(int(requests_per_minute), 1)
+
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("Scope symbols", f"{len(scope_symbols):,}")
+        metric_cols[1].metric("Complete", f"{len(complete_symbols):,}")
+        metric_cols[2].metric("Remaining for mode", f"{len(pending_symbols):,}")
+        metric_cols[3].metric("This run", f"{len(symbols_to_run):,}")
+        metric_cols[4].metric("Chunks left", f"{chunks_remaining:,}")
+
+        if scope_symbols:
+            coverage_pct = 100.0 * len(complete_symbols) / max(len(scope_symbols), 1)
+            st.progress(min(coverage_pct / 100.0, 1.0), text=f"Historical coverage: {coverage_pct:.1f}% for {int(years)} year(s)")
+
+        st.caption(
+            f"Date range: {start_date.isoformat()} → {end_date.isoformat()}. "
+            f"Expected daily bars/symbol: ~{expected_bars:,}; complete threshold: {complete_bars:,}. "
+            f"Estimated API calls remaining: {total_estimated_calls:,}. "
+            f"This run will process {len(symbols_to_run):,} symbol(s) across {run_chunk_count:,} chunk(s). "
+            f"Estimated API time: {estimated_minutes_total:.1f} min total, "
+            f"{estimated_minutes_run:.1f} min for this run before network/API overhead."
+        )
+
+        preview_symbols = pending_symbols[: int(preview_rows)]
+        if preview_symbols:
+            st.markdown("#### Upcoming historical symbols")
+            st.dataframe(
+                _historical_progress_frame(preview_symbols, start_date, end_date, expected_bars),
+                use_container_width=True,
+                hide_index=True,
+                column_config={"coverage_pct": st.column_config.NumberColumn("Coverage %", format="%.1f%%")},
+            )
+        elif scope_symbols:
+            st.success("No pending symbols for the selected historical mode and range.")
+        else:
+            st.info("Select a scope with at least one symbol.")
+
+        if st.button(
+            "Run historical backfill",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(settings.massive_api_key and symbols_to_run),
+        ):
+            service_scope = (
+                f"{historical_scope}; mode={history_mode}; years={years}; "
+                f"chunk_size={chunk_size}; chunks_to_run={run_chunk_count}; requests_per_minute={requests_per_minute}; "
+                f"range={start_date.isoformat()}..{end_date.isoformat()}"
+            )
+            service_run_id = database.start_service_run(
+                "historical_data",
+                scope=service_scope,
+                requested_count=len(symbols_to_run),
+            )
+            try:
+                result = _sync_historical_symbols(
+                    symbols_to_run,
+                    start=start_date,
+                    end=end_date,
+                    requests_per_minute=int(requests_per_minute),
+                    chunk_size=int(chunk_size),
+                )
+                errors = result["errors"]
+                status = "partial" if errors else "success"
+                database.finish_service_run(
+                    service_run_id,
+                    status=status,
+                    processed_count=len(symbols_to_run),
+                    success_count=int(result["symbols_success"]),
+                    skipped_count=0,
+                    error_count=len(errors),
+                    duration_seconds=float(result["duration"]),
+                    message=f"bars_written={result['bars_written']}, chunks={result.get('chunks_processed', 0)}, errors={len(errors)}",
+                )
+                st.success(
+                    "Historical chunk complete: "
+                    f"symbols={result['symbols_success']}/{len(symbols_to_run)}, "
+                    f"chunks={result.get('chunks_processed', 0)}, bars_written={result['bars_written']:,}, errors={len(errors)}, "
+                    f"duration={float(result['duration']):.1f}s"
+                )
+                if errors:
+                    st.error("Some symbols failed. They can be retried in a later chunk.")
+                    st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
+            except Exception as exc:
+                database.finish_service_run(
+                    service_run_id,
+                    status="failed",
+                    error_count=1,
+                    message=str(exc),
+                )
+                st.cache_data.clear()
+                st.error(f"Historical chunk failed: {exc}")
+
     with st.expander("Data ingestion: company profiles", expanded=False):
         st.markdown(
             "Populate or refresh company profile metadata such as company name, SIC/sector-style description, "

@@ -203,6 +203,17 @@ Market snapshot ingestion:
 - supports minimum price, volume, dollar-volume, and max-symbol filters;
 - is the preferred first step before heavier enrichment jobs.
 
+Historical data ingestion:
+
+- backfills daily bars for the stock universe, selected lists, typed tickers, or lists plus typed tickers;
+- lets you choose 1–5 years of history;
+- uses one historical aggregate API call per symbol for the selected date range, not one call per day;
+- supports chunk size, chunks-to-run, run-all-remaining, and requests/minute controls so large scopes can be populated safely;
+- estimates API calls, chunk count, total API time, and selected-run API time before running;
+- can automatically continue across multiple chunks after one click;
+- shows coverage and run progress in the Services card;
+- logs runs as `historical_data` in **Latest runs → Service runs**.
+
 Company profile ingestion:
 
 - choose `Stocks universe`, selected lists, typed tickers, or lists plus typed tickers;
@@ -254,7 +265,7 @@ The Streamlit dashboard currently includes:
 - **Lists** — full-width list workspace with existing-list table, create/manage selector, manual ticker management, and signal-derived list creation.
 - **Signal Builder** — configurable technical-signal definitions stored in SQLite, with inline component help, examples, and universe selection by lists/tickers.
 - **Notifications** — Telegram configuration status, missing-rule prompts for newly created signals, editable scheduled alert rules, pending alerts, recent alerts, and delivery history.
-- **Services** — bounded maintenance/data-ingestion actions, including market snapshots and chunked company-profile ingestion for the stock universe, selected lists, or typed tickers.
+- **Services** — bounded maintenance/data-ingestion actions, including market snapshots, chunked historical-data backfills, and chunked company-profile ingestion for the stock universe, selected lists, or typed tickers.
 - **Latest runs** — fetch logs, signal-run history, service-run history, and scan-cycle history.
 
 The Signal Builder supports weighted score components and hard gate/filter components. Current component types include:
@@ -803,9 +814,10 @@ For the current project stage:
 1. Upload/deploy the latest code first.
 2. Run stock-notifier init-db on the server.
 3. Use Services → Market snapshot to populate lightweight price/volume data.
-4. Backfill 250–320 days only for lists or symbols you plan to score.
-5. Run score-all and alerts-scan --dry-run.
-6. Add larger historical backfills later, preferably as an overnight/background service.
+4. Use Lists → Create or update a list from a signal to build focused universes such as `Liquid Universe`.
+5. Use Services → Historical data to backfill 1–5 years for selected lists or typed tickers in chunks.
+6. Run score-all and alerts-scan --dry-run.
+7. Add larger historical backfills later, preferably as repeated chunks or an overnight/background service.
 ```
 
 ## Deploy local code changes to Oracle
