@@ -77,7 +77,7 @@ def _deliver_alert(
     database: Database,
     settings: Settings,
     *,
-    alert_id: int,
+    alert_id: int | None,
     alert: dict[str, Any],
     components: list[dict[str, Any]],
     dry_run: bool,
@@ -88,6 +88,10 @@ def _deliver_alert(
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
+        "kind": "signal-alert",
+        "signal_name": str(alert.get("signal_name") or ""),
+        "symbol": str(alert.get("symbol") or ""),
+        "direction": str(alert.get("direction") or ""),
     }
     if dry_run:
         database.record_notification_delivery(
@@ -107,7 +111,10 @@ def _deliver_alert(
         alert_id=alert_id,
         channel_type="telegram",
         status="delivered" if result.ok else "failed",
-        request=result.request,
+        request={
+            **result.request,
+            **{key: value for key, value in request_payload.items() if key not in result.request},
+        },
         response=result.response,
         error_text=result.error_text,
     )
@@ -173,13 +180,14 @@ def _process_pending_alerts(
     *,
     now: datetime,
     dry_run: bool,
+    signal_names: set[str] | None = None,
 ) -> tuple[int, int, int, int]:
     alerts_created = 0
     deliveries_attempted = 0
     delivered = 0
     dropped = 0
 
-    for pending in database.pending_alerts_for_rules():
+    for pending in database.pending_alerts_for_rules(signal_names=signal_names):
         direction = str(pending["direction"])
         latest_score = pending.get("latest_score")
         if latest_score is None or not int(pending.get("latest_eligible") or 0):
@@ -242,6 +250,7 @@ def scan_alerts(
     *,
     dry_run: bool | None = None,
     now: datetime | None = None,
+    signal_names: set[str] | None = None,
 ) -> AlertScanResult:
     effective_dry_run = settings.alert_dry_run if dry_run is None else dry_run
     database.upsert_notification_channel(
@@ -265,13 +274,14 @@ def scan_alerts(
         settings,
         now=scan_time,
         dry_run=effective_dry_run,
+        signal_names=signal_names,
     )
     alerts_created += pending_counts[0]
     deliveries_attempted += pending_counts[1]
     delivered += pending_counts[2]
     dropped += pending_counts[3]
 
-    for score_row in database.latest_scores_for_alert_rules():
+    for score_row in database.latest_scores_for_alert_rules(signal_names=signal_names):
         evaluated += 1
         score = float(score_row["score"])
         signal_name = str(score_row["signal_name"])
@@ -377,6 +387,7 @@ def send_telegram_test(
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
+        "kind": "telegram-test",
     }
     if effective_dry_run:
         database.record_notification_delivery(
@@ -396,7 +407,93 @@ def send_telegram_test(
         alert_id=None,
         channel_type="telegram",
         status="delivered" if result.ok else "failed",
-        request=result.request,
+        request={
+            **result.request,
+            **{key: value for key, value in request_payload.items() if key not in result.request},
+        },
+        response=result.response,
+        error_text=result.error_text,
+    )
+    return result.ok
+
+
+def send_sample_alert(
+    database: Database,
+    settings: Settings,
+    *,
+    signal_name: str,
+    symbol: str,
+    direction: str = "BUY",
+    dry_run: bool | None = None,
+) -> bool:
+    effective_dry_run = settings.alert_dry_run if dry_run is None else dry_run
+    direction = direction.upper().strip()
+    if direction not in {"BUY", "SELL"}:
+        raise ValueError("direction must be BUY or SELL")
+    symbol = symbol.upper().strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+
+    score_row = database.latest_score_for_signal_symbol(signal_name, symbol)
+    rules = {str(row["signal_name"]).lower(): row for row in database.list_alert_rules()}
+    rule = rules.get(signal_name.lower())
+    threshold = (
+        float(rule["buy_threshold"] if direction == "BUY" else rule["sell_threshold"])
+        if rule
+        else (settings.alert_default_buy_threshold if direction == "BUY" else settings.alert_default_sell_threshold)
+    )
+
+    if score_row:
+        components = database.score_components_for_score(int(score_row["score_id"]))
+        alert = {
+            **score_row,
+            "direction": direction,
+            "threshold": threshold,
+            "message": f"Sample {direction} alert using latest saved score; no alert state was changed",
+        }
+    else:
+        components = []
+        alert = {
+            "signal_name": signal_name,
+            "symbol": symbol,
+            "direction": direction,
+            "score": 0.0,
+            "threshold": threshold,
+            "trading_date": "sample",
+            "close": None,
+            "message": "Sample alert only; no latest saved score was found",
+        }
+
+    text = format_alert_message(alert, components, dashboard_base_url=settings.dashboard_base_url)
+    request_payload = {
+        "chat_id": settings.telegram_chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "kind": "sample-alert",
+    }
+    if effective_dry_run:
+        database.record_notification_delivery(
+            alert_id=None,
+            channel_type="telegram",
+            status="dry_run",
+            request=request_payload,
+            response={"dry_run": True, "kind": "sample-alert"},
+        )
+        return False
+
+    result = TelegramClient(
+        settings.telegram_bot_token,
+        timeout_seconds=settings.http_timeout_seconds,
+    ).send_message(chat_id=settings.telegram_chat_id, text=text)
+    database.record_notification_delivery(
+        alert_id=None,
+        channel_type="telegram",
+        status="delivered" if result.ok else "failed",
+        request={
+            **result.request,
+            **{key: value for key, value in request_payload.items() if key not in result.request},
+        },
         response=result.response,
         error_text=result.error_text,
     )

@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
@@ -11,10 +12,22 @@ import streamlit as st
 
 from stock_notifier.config import Settings
 from stock_notifier.db import Database
-from stock_notifier.notifications.service import scan_alerts, seed_alert_rules, send_telegram_test
+from stock_notifier.notifications.service import scan_alerts, seed_alert_rules, send_sample_alert, send_telegram_test
+from stock_notifier.pipeline import run_scan_cycle, scan_cycle_lock
 from stock_notifier.notifications.schedule import next_eligible_send_at, parse_schedule
 from stock_notifier.providers.massive import MassiveClient
-from stock_notifier.scoring.service import score_signal, seed_starter_signals
+from stock_notifier.scoring.engine import SignalDefinition, evaluate_signal
+from stock_notifier.scoring.service import required_history_bars, score_signal, seed_starter_signals
+from stock_notifier.services.scheduler import (
+    SCHEDULE_UNITS,
+    get_service_schedule,
+    get_signal_schedule,
+    is_service_due,
+    is_signal_due,
+    run_signal_test_alert,
+    save_service_schedule,
+    save_signal_schedule,
+)
 
 st.set_page_config(page_title="Stock Signal Notifier", layout="wide")
 settings = Settings.from_env(require_api_key=False)
@@ -22,12 +35,20 @@ database = Database(settings.db_path)
 database.initialize()
 
 
-@st.cache_data(ttl=60)
-def read_frame(query: str, parameters: tuple[object, ...] = ()) -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner=False)
+def read_frame(
+    query: str,
+    parameters: tuple[object, ...] = (),
+    db_cache_key: float | None = None,
+) -> pd.DataFrame:
+    del db_cache_key  # only used to invalidate cache when the SQLite file changes
     if not settings.db_path.exists():
         return pd.DataFrame()
     with sqlite3.connect(settings.db_path) as connection:
         return pd.read_sql_query(query, connection, params=parameters)
+
+
+DISPLAY_TIMEZONE = ZoneInfo("America/New_York")
 
 
 def _format_timestamp(value: object) -> str:
@@ -36,8 +57,9 @@ def _format_timestamp(value: object) -> str:
     timestamp = pd.to_datetime(value, errors="coerce")
     if pd.isna(timestamp):
         return str(value)
-    if getattr(timestamp, "tzinfo", None) is not None:
-        timestamp = timestamp.tz_convert(None)
+    if getattr(timestamp, "tzinfo", None) is None:
+        timestamp = timestamp.tz_localize("UTC")
+    timestamp = timestamp.tz_convert(DISPLAY_TIMEZONE)
     return timestamp.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -56,16 +78,163 @@ def _format_timestamps(frame: pd.DataFrame) -> pd.DataFrame:
     return formatted
 
 
+def _humanize_column_name(column: str) -> str:
+    replacements = {
+        "id": "ID",
+        "url": "URL",
+        "api": "API",
+        "json": "JSON",
+        "pct": "%",
+    }
+    words = str(column).replace("_", " ").split()
+    return " ".join(replacements.get(word.lower(), word.capitalize()) for word in words)
+
+
+def _display_history_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    display = _format_timestamps(frame.copy())
+    return display.rename(columns={column: _humanize_column_name(column) for column in display.columns})
+
+
+def _json_object(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _line_value(text: str, label: str) -> str:
+    prefix = f"{label}:"
+    for line in str(text or "").splitlines():
+        if line.strip().startswith(prefix):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _notification_type_and_related(row: pd.Series) -> pd.Series:
+    request = _json_object(row.get("request_json"))
+    response = _json_object(row.get("response_json"))
+    kind = str(request.get("kind") or response.get("kind") or "").strip()
+    text = str(request.get("text") or "")
+    alert_id = row.get("alert_id")
+    signal_name = str(row.get("signal_name") or "").strip()
+    symbol = str(row.get("symbol") or "").strip()
+    direction = str(row.get("direction") or "").strip()
+
+    if pd.notna(alert_id) and str(alert_id).strip() and str(alert_id).strip() != "0":
+        related = " · ".join(part for part in [direction, symbol, signal_name] if part)
+        return pd.Series({"notification_type": "Signal alert", "related_item": related or f"Alert #{alert_id}"})
+
+    if kind == "scheduled-service" or "Stock Notifier service" in text:
+        service_name = str(request.get("service_label") or "").strip()
+        if not service_name:
+            service_name = _line_value(text, "Service")
+        if not service_name:
+            service_key = str(request.get("service") or "").strip()
+            service_name = {
+                "snapshot": "Market snapshot",
+                "historical": "Historical data",
+                "profiles": "Company profiles",
+            }.get(service_key, service_key)
+        return pd.Series({"notification_type": "Service run", "related_item": service_name})
+
+    if kind in {"scheduled-signal", "scheduled-signal-digest"} or "Stock Notifier signal schedule" in text:
+        scheduled_signal_name = str(request.get("signal_name") or "").strip()
+        if not scheduled_signal_name:
+            scheduled_signal_name = _line_value(text, "Signal")
+        notification_type = "Signal digest" if kind == "scheduled-signal-digest" else "Signal scheduled run"
+        return pd.Series({"notification_type": notification_type, "related_item": scheduled_signal_name})
+
+    if kind == "sample-alert":
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        return pd.Series({"notification_type": "Sample alert", "related_item": first_line})
+
+    if kind == "telegram-test" or "Telegram test" in text or "test message" in text.lower():
+        return pd.Series({"notification_type": "Telegram test", "related_item": "Configuration test"})
+
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return pd.Series({"notification_type": "Telegram message", "related_item": first_line})
+
+
+def _display_notification_deliveries(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    display = frame.copy()
+    context = display.apply(_notification_type_and_related, axis=1)
+    display.insert(1, "notification_type", context["notification_type"])
+    display.insert(2, "related_item", context["related_item"])
+    display = display.drop(columns=["request_json", "response_json"], errors="ignore")
+    ordered_columns = [
+        "created_at",
+        "notification_type",
+        "related_item",
+        "channel_type",
+        "status",
+        "alert_id",
+        "direction",
+        "symbol",
+        "signal_name",
+        "error_text",
+    ]
+    display = display[[column for column in ordered_columns if column in display.columns]]
+    return _display_history_frame(display)
+
+
+def _display_market_data_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    display = _format_timestamps(frame.copy())
+    return display.rename(
+        columns={
+            "ticker": "Ticker",
+            "name": "Name",
+            "asset_type": "Asset type",
+            "sic_description": "SIC description",
+            "market_cap": "Market cap",
+            "trading_date": "Trading date",
+            "close": "Close",
+            "previous_close": "Previous close",
+            "volume": "Volume",
+            "daily_change_pct": "Daily change %",
+            "dollar_volume": "Dollar volume",
+        }
+    )
+
+
 st.title("Stock Signal Notifier")
 st.caption("Configurable signal scoring · full-market snapshots · scheduled Telegram alerts")
 
 
-def _latest_watchlist() -> pd.DataFrame:
+def _latest_watchlist(symbols: set[str] | None = None) -> pd.DataFrame:
+    requested_symbols = sorted({symbol.upper().strip() for symbol in symbols or set() if symbol.strip()})
+    if symbols is not None and not requested_symbols:
+        return pd.DataFrame()
+    symbol_filter = ""
+    parameters: tuple[object, ...] = ()
+    if requested_symbols:
+        placeholders = ", ".join("?" for _ in requested_symbols)
+        symbol_filter = f" AND s.ticker IN ({placeholders})"
+        parameters = tuple(requested_symbols)
     return read_frame(
-        """
-        WITH ranked AS (
-            SELECT b.*, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY trading_date DESC) AS rn
+        f"""
+        WITH latest_dates AS (
+            SELECT symbol, MAX(trading_date) AS trading_date
+            FROM daily_bars
+            GROUP BY symbol
+        ),
+        previous_dates AS (
+            SELECT b.symbol, MAX(b.trading_date) AS trading_date
             FROM daily_bars b
+            JOIN latest_dates latest
+              ON latest.symbol = b.symbol
+             AND b.trading_date < latest.trading_date
+            GROUP BY b.symbol
         )
         SELECT s.ticker,
                COALESCE(NULLIF(p.name, ''), s.name) AS name,
@@ -84,11 +253,20 @@ def _latest_watchlist() -> pd.DataFrame:
         FROM symbols s
         LEFT JOIN company_profiles p ON p.ticker = s.ticker
         LEFT JOIN market_snapshots m ON m.symbol = s.ticker
-        LEFT JOIN ranked current ON current.symbol = s.ticker AND current.rn = 1
-        LEFT JOIN ranked previous ON previous.symbol = s.ticker AND previous.rn = 2
+        LEFT JOIN latest_dates latest ON latest.symbol = s.ticker
+        LEFT JOIN daily_bars current
+          ON current.symbol = latest.symbol
+         AND current.trading_date = latest.trading_date
+        LEFT JOIN previous_dates previous_day ON previous_day.symbol = s.ticker
+        LEFT JOIN daily_bars previous
+          ON previous.symbol = previous_day.symbol
+         AND previous.trading_date = previous_day.trading_date
         WHERE s.active = 1
+          {symbol_filter}
         ORDER BY s.ticker
-        """
+        """,
+        parameters,
+        db_cache_key=_db_cache_key(),
     )
 
 
@@ -386,6 +564,36 @@ def _latest_snapshot_status() -> dict[str, object]:
     return dict(rows[0]) if rows else {"count": 0, "latest_fetched_at": None, "latest_snapshot_at": None}
 
 
+def _db_cache_key() -> float:
+    try:
+        return settings.db_path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+@st.cache_data(ttl=300)
+def _symbol_history(symbol: str, db_cache_key: float) -> pd.DataFrame:
+    del db_cache_key  # only used to invalidate cache when the SQLite file changes
+    if not settings.db_path.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(settings.db_path) as connection:
+        history = pd.read_sql_query(
+            """
+            SELECT trading_date, open, high, low, close, volume
+            FROM daily_bars
+            WHERE symbol = ?
+            ORDER BY trading_date
+            """,
+            connection,
+            params=(symbol,),
+        )
+    if history.empty:
+        return history
+    history["trading_date"] = pd.to_datetime(history["trading_date"], errors="coerce")
+    history = history.dropna(subset=["trading_date"]).sort_values("trading_date").reset_index(drop=True)
+    return history
+
+
 def _history_for_range(history: pd.DataFrame, range_label: str) -> pd.DataFrame:
     rows_by_range = {
         "Intraday": 1,
@@ -395,13 +603,29 @@ def _history_for_range(history: pd.DataFrame, range_label: str) -> pd.DataFrame:
         "3M": 66,
         "6M": 132,
         "1Y": 252,
+        "3Y": 756,
     }
     row_count = rows_by_range.get(range_label, 66)
-    return history.tail(row_count).copy()
+    visible = history.tail(row_count).copy().reset_index(drop=True)
+    if visible.empty:
+        return visible
+    visible["trade_index"] = range(len(visible))
+    visible["date_label"] = visible["trading_date"].dt.strftime("%Y-%m-%d")
+    return visible
 
 
 def _render_price_volume_chart(history: pd.DataFrame, selected: str) -> None:
-    base = alt.Chart(history).encode(x=alt.X("trading_date:T", title="Date"))
+    if history.empty:
+        st.info("No historical bars available for this symbol yet.")
+        return
+    base = alt.Chart(history).encode(
+        x=alt.X(
+            "date_label:O",
+            title="Date",
+            sort=None,
+            axis=alt.Axis(labelAngle=-45, labelOverlap=True, labelLimit=90),
+        )
+    )
     price = (
         base.mark_line(point=True)
         .encode(
@@ -790,10 +1014,12 @@ def _market_view_options() -> list[dict[str, object]]:
 def _select_market_view() -> dict[str, object]:
     options = _market_view_options()
     labels = [str(option["label"]) for option in options]
-    selected_label = str(st.session_state.get("market_view_label", labels[0]))
+    persisted_label = str(_app_setting("market_data.selected_view_label", labels[0]))
+    selected_label = str(st.session_state.get("market_view_label", persisted_label))
     if selected_label not in labels:
         selected_label = labels[0]
         st.session_state.market_view_label = selected_label
+        database.set_app_setting("dashboard.market_data.selected_view_label", selected_label)
     generation = int(st.session_state.get("market_view_generation", 0))
 
     st.caption("Choose one view:")
@@ -820,6 +1046,7 @@ def _select_market_view() -> dict[str, object]:
 
     if next_label != selected_label or len(checked_labels) > 1:
         st.session_state.market_view_label = next_label
+        database.set_app_setting("dashboard.market_data.selected_view_label", next_label)
         st.session_state.market_view_generation = generation + 1
         if next_label != selected_label:
             st.rerun()
@@ -984,14 +1211,15 @@ def _component_from_inputs(index: int, default_component: dict[str, object] | No
             period_label = "Fast period"
         elif component_type == "price_change_pct":
             period_label = "Change days"
-        period = st.number_input(
-            period_label,
-            value=int(period),
-            min_value=1,
-            step=1,
-            key=f"component_period_{index}",
-            help="Number of daily bars used. In 15-minute scan cycles, the latest snapshot is appended as the current bar, but lookback periods are still daily bars.",
-        )
+        with parameter_columns[0]:
+            period = st.number_input(
+                period_label,
+                value=int(period),
+                min_value=1,
+                step=1,
+                key=f"component_period_{index}",
+                help="Number of daily bars used. In 15-minute scan cycles, the latest snapshot is appended as the current bar, but lookback periods are still daily bars.",
+            )
     else:
         with parameter_columns[0]:
             st.caption("No lookback period needed for this component.")
@@ -1142,6 +1370,177 @@ def _load_signal_builder_form_state(selected_row: dict[str, object] | None) -> N
         )
 
 
+def _signal_preview_symbols(config: dict[str, object]) -> set[str]:
+    universe = dict(config.get("universe") or {})
+    configured_symbols = {
+        str(symbol).strip().upper()
+        for symbol in universe.get("symbols", [])
+        if str(symbol).strip()
+    }
+    configured_lists = [
+        str(name).strip()
+        for name in universe.get("lists", [])
+        if str(name).strip()
+    ]
+    configured_universe = configured_symbols | database.symbols_for_list_names(configured_lists)
+    if universe.get("mode") == "selected" and configured_universe:
+        return configured_universe
+    return set(database.active_symbols())
+
+
+def _history_frames_for_preview(history: dict[str, list[object]]) -> dict[str, pd.DataFrame]:
+    frames: dict[str, pd.DataFrame] = {}
+    for symbol, rows in history.items():
+        records = [dict(row) for row in rows]
+        if records:
+            frames[symbol] = pd.DataFrame.from_records(records)
+    return frames
+
+
+def _signal_preview_key(selected_row: dict[str, object] | None, signal_name: str) -> str:
+    if selected_row and selected_row.get("id"):
+        return f"signal_builder.preview.signal_id.{int(selected_row['id'])}"
+    normalized = (signal_name or "unsaved").strip().lower().replace(" ", "_")[:80]
+    return f"signal_builder.preview.unsaved.{normalized or 'preview'}"
+
+
+def _clear_signal_builder_preview_state() -> None:
+    for key in [
+        "signal_builder_preview_rows",
+        "signal_builder_preview_components",
+        "signal_builder_preview_label",
+        "signal_builder_preview_detail_symbol",
+        "signal_builder_preview_run_at",
+        "signal_builder_preview_config_json",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def _preview_payload_from_results(
+    *,
+    results: list[object],
+    label: str,
+    config: dict[str, object],
+    duration_seconds: float | None = None,
+) -> dict[str, object]:
+    return {
+        "label": label,
+        "run_at": datetime.now(UTC).isoformat(),
+        "duration_seconds": duration_seconds,
+        "config_json": json.dumps(config, sort_keys=True),
+        "rows": [
+            {
+                "symbol": item.symbol,
+                "score": item.score,
+                "eligible": item.eligible,
+                "trading_date": item.trading_date,
+                "close": item.close,
+                "message": item.message,
+            }
+            for item in results
+        ],
+        "components": {
+            item.symbol: [component.__dict__ for component in item.components]
+            for item in results
+        },
+    }
+
+
+def _load_signal_preview_payload(preview_key: str) -> dict[str, object] | None:
+    payload = database.get_app_setting(preview_key, None)
+    return payload if isinstance(payload, dict) else None
+
+
+def _save_signal_preview_payload(preview_key: str, payload: dict[str, object]) -> None:
+    database.set_app_setting(preview_key, payload)
+
+
+def _hydrate_signal_builder_preview_state(payload: dict[str, object] | None) -> None:
+    _clear_signal_builder_preview_state()
+    if not payload:
+        return
+    st.session_state.signal_builder_preview_rows = payload.get("rows") or []
+    st.session_state.signal_builder_preview_components = payload.get("components") or {}
+    st.session_state.signal_builder_preview_label = payload.get("label") or "Preview"
+    st.session_state.signal_builder_preview_run_at = payload.get("run_at") or ""
+    st.session_state.signal_builder_preview_config_json = payload.get("config_json") or ""
+
+
+def _display_component_breakdown_frame(components: list[dict[str, object]]) -> pd.DataFrame:
+    if not components:
+        return pd.DataFrame()
+    display = pd.DataFrame(components).copy()
+    if "mode" in display.columns:
+        gate_mask = display["mode"].astype(str).str.lower().eq("gate")
+        for column in ["score", "weight", "contribution"]:
+            if column in display.columns:
+                display[column] = display[column].astype(object)
+                display.loc[gate_mask, column] = "Filter only"
+    return display.rename(
+        columns={
+            "name": "Name",
+            "component_type": "Component type",
+            "mode": "Mode",
+            "value": "Value",
+            "passed": "Passed",
+            "score": "Score",
+            "weight": "Weight",
+            "contribution": "Contribution",
+            "message": "Message",
+        }
+    )
+
+
+def _preview_cancel_requested() -> bool:
+    return bool(st.session_state.get("signal_builder_cancel_preview"))
+
+
+def _raise_if_preview_cancelled() -> None:
+    if _preview_cancel_requested():
+        st.session_state.signal_builder_cancel_preview = False
+        raise RuntimeError("Preview cancelled by user.")
+
+
+def _preview_signal_with_progress(preview_row: dict[str, object]) -> tuple[list[object], float]:
+    started = time.monotonic()
+    progress = st.progress(0.0, text="Preparing preview...")
+    status = st.empty()
+    config = dict(preview_row["config"])
+    _raise_if_preview_cancelled()
+
+    symbols = _signal_preview_symbols(config)
+    progress.progress(0.1, text=f"Resolved preview universe: {len(symbols):,} symbols")
+    if len(symbols) >= 1000:
+        status.warning(
+            f"Large preview: {len(symbols):,} symbols. This can take several minutes because it loads historical bars and evaluates indicators."
+        )
+    else:
+        status.caption(f"Preview universe: {len(symbols):,} symbols")
+    _raise_if_preview_cancelled()
+
+    required_bars = required_history_bars(config)
+    progress.progress(0.25, text=f"Loading latest {required_bars} daily bars per symbol from SQLite...")
+    history = database.load_price_history(symbols, min_bars=required_bars, include_latest_snapshot=False)
+    _raise_if_preview_cancelled()
+
+    progress.progress(0.55, text=f"Loaded history for {len(history):,} symbols; building frames...")
+    frames = _history_frames_for_preview(history)
+    definition = SignalDefinition(
+        name=str(preview_row["name"]),
+        config=config,
+        signal_id=int(preview_row["id"] or 0),
+        enabled=bool(preview_row["enabled"]),
+    )
+    progress.progress(0.75, text=f"Evaluating signal components for {len(frames):,} symbols...")
+    _raise_if_preview_cancelled()
+
+    results = evaluate_signal(definition, frames)
+    duration = time.monotonic() - started
+    progress.progress(1.0, text=f"Preview complete: {len(results):,} scored symbols in {duration:.1f}s")
+    status.success(f"Preview complete in {duration:.1f}s. Scored {len(results):,} symbols.")
+    return results, duration
+
+
 def _render_signal_builder() -> None:
     st.subheader("Signal Builder")
     flash_message = st.session_state.pop("signal_builder_flash", None)
@@ -1150,76 +1549,97 @@ def _render_signal_builder() -> None:
     st.caption("Build weighted/gated technical signals without changing backend code.")
     _render_signal_builder_help()
 
-    left, right = st.columns([1, 2])
-    with left:
-        if st.button("Seed/update starter signals", use_container_width=True):
-            count = seed_starter_signals(database)
-            st.success(f"Seeded {count} starter signals.")
-            st.cache_data.clear()
-            st.rerun()
+    if st.button("Seed/update starter signals", use_container_width=True):
+        count = seed_starter_signals(database)
+        st.success(f"Seeded {count} starter signals.")
+        st.cache_data.clear()
+        st.rerun()
 
-        definitions = database.list_signal_definitions()
-        options = ["New signal"] + [f"{item['id']}: {item['name']}" for item in definitions]
-        pending_selection = st.session_state.pop("signal_builder_pending_selection", None)
-        force_reload = bool(st.session_state.pop("signal_builder_force_reload", False))
-        if pending_selection in options:
-            st.session_state.signal_builder_selected = pending_selection
-            force_reload = True
-        if force_reload:
-            st.session_state.signal_builder_loaded_selection = None
-        selected = st.selectbox("Saved signal", options, key="signal_builder_selected")
-        selected_row = None
-        if selected != "New signal":
-            selected_id = int(selected.split(":", 1)[0])
-            selected_row = database.get_signal_definition(selected_id)
-        if st.session_state.get("signal_builder_loaded_selection") != selected:
-            _load_signal_builder_form_state(selected_row)
-            st.session_state.signal_builder_loaded_selection = selected
+    definitions = database.list_signal_definitions()
+    options = ["Create New Signal"] + [f"{item['id']}: {item['name']}" for item in definitions]
+    pending_selection = st.session_state.pop("signal_builder_pending_selection", None)
+    force_reload = bool(st.session_state.pop("signal_builder_force_reload", False))
+    if pending_selection in options:
+        st.session_state.signal_builder_selected = pending_selection
+        force_reload = True
+    if st.session_state.get("signal_builder_selected") not in options:
+        st.session_state.signal_builder_selected = "Create New Signal"
+    if force_reload:
+        st.session_state.signal_builder_loaded_selection = None
 
-        if selected_row and st.button("Delete selected signal", type="secondary", use_container_width=True):
-            database.delete_signal_definition(int(selected_row["id"]))
-            st.cache_data.clear()
-            st.rerun()
+    st.markdown("#### Create/Manage Signals")
+    selected = st.selectbox("Signal", options, key="signal_builder_selected")
+    selected_row = None
+    if selected != "Create New Signal":
+        selected_id = int(selected.split(":", 1)[0])
+        selected_row = database.get_signal_definition(selected_id)
+    preview_storage_key = _signal_preview_key(selected_row, selected_row["name"] if selected_row else "")
+    if st.session_state.get("signal_builder_loaded_selection") != selected:
+        _load_signal_builder_form_state(selected_row)
+        st.session_state.signal_builder_loaded_selection = selected
+        _hydrate_signal_builder_preview_state(_load_signal_preview_payload(preview_storage_key))
 
     default_config = selected_row["config"] if selected_row else _signal_builder_empty_config()
-    with right:
+    detail_columns = st.columns([1.6, 0.5, 2.4])
+    with detail_columns[0]:
         signal_name = st.text_input(
             "Signal name",
             value=selected_row["name"] if selected_row else "",
             key="signal_builder_name",
         )
+        if selected_row:
+            delete_label = f"Delete {selected_row['name']}"
+            if st.button(delete_label, key="delete_signal_button", type="secondary", use_container_width=True):
+                database.delete_signal_definition(int(selected_row["id"]))
+                st.session_state.signal_builder_pending_selection = "Create New Signal"
+                st.cache_data.clear()
+                st.rerun()
+    with detail_columns[1]:
         enabled = st.checkbox(
             "Enabled",
             value=bool(selected_row["enabled"]) if selected_row else True,
             key="signal_builder_enabled",
         )
+    with detail_columns[2]:
         description = st.text_input(
             "Description",
             value=str(default_config.get("description") or selected_row.get("description") if selected_row else ""),
             key="signal_builder_description",
         )
-        universe_mode = st.radio(
-            "Universe",
-            ["all", "selected"],
-            horizontal=True,
-            index=0 if (default_config.get("universe") or {}).get("mode") != "selected" else 1,
-            key="signal_builder_universe_mode",
-            help="Use all active symbols, or restrict this signal to selected lists and/or typed tickers.",
-        )
-        available_lists = [item["name"] for item in database.list_symbol_lists()]
-        selected_lists = st.multiselect(
-            "Selected lists",
-            available_lists,
-            default=(default_config.get("universe") or {}).get("lists") or [],
-            key="signal_builder_selected_lists",
-            help="Only used when Universe is selected. Symbols from all selected lists are combined.",
-        )
-        selected_symbols_text = st.text_input(
-            "Extra selected tickers",
-            value=", ".join((default_config.get("universe") or {}).get("symbols") or []),
-            key="signal_builder_selected_symbols",
-            help="Optional comma-separated tickers. Only used when Universe is selected.",
-        )
+
+    preview_storage_key = _signal_preview_key(selected_row, signal_name)
+    if not st.session_state.get("signal_builder_preview_rows"):
+        _hydrate_signal_builder_preview_state(_load_signal_preview_payload(preview_storage_key))
+
+    universe_config = default_config.get("universe") or {}
+    universe_mode = st.radio(
+        "Universe",
+        ["all", "selected"],
+        horizontal=True,
+        index=0 if universe_config.get("mode") != "selected" else 1,
+        key="signal_builder_universe_mode",
+        help="Use all active symbols, or restrict this signal to selected lists and/or typed tickers.",
+    )
+    available_lists = [item["name"] for item in database.list_symbol_lists()]
+    selected_lists: list[str] = []
+    selected_symbols_text = ""
+    if universe_mode == "selected":
+        universe_columns = st.columns([1.5, 2])
+        with universe_columns[0]:
+            selected_lists = st.multiselect(
+                "Selected lists",
+                available_lists,
+                default=universe_config.get("lists") or [],
+                key="signal_builder_selected_lists",
+                help="Symbols from all selected lists are combined.",
+            )
+        with universe_columns[1]:
+            selected_symbols_text = st.text_input(
+                "Extra selected tickers",
+                value=", ".join(universe_config.get("symbols") or []),
+                key="signal_builder_selected_symbols",
+                help="Optional comma-separated tickers to add to the selected lists.",
+            )
 
     st.markdown("#### Component builder")
     default_components = list(default_config.get("components") or [])
@@ -1263,7 +1683,16 @@ def _render_signal_builder() -> None:
         )
         st.caption("Tip: if a component is a gate, its weight and score min/max are ignored.")
 
-    action_left, action_right = st.columns(2)
+    preview_symbol_count = len(_signal_preview_symbols(generated_config))
+    if preview_symbol_count >= 1000:
+        st.warning(
+            f"Preview universe has {preview_symbol_count:,} symbols. Preview may take several minutes. "
+            "For faster iteration, use a selected list or build a liquidity list first."
+        )
+
+    action_left, action_mid, action_right = st.columns([1, 1, 1])
+    preview_clicked = False
+    preview_running = bool(st.session_state.get("signal_builder_preview_running"))
     with action_left:
         if st.button("Save signal definition", type="primary", use_container_width=True):
             if not signal_name.strip():
@@ -1278,6 +1707,19 @@ def _render_signal_builder() -> None:
                         enabled=enabled,
                         description=str(parsed_config.get("description") or description),
                     )
+                    current_preview_rows = st.session_state.get("signal_builder_preview_rows") or []
+                    if current_preview_rows:
+                        _save_signal_preview_payload(
+                            f"signal_builder.preview.signal_id.{saved_id}",
+                            {
+                                "label": st.session_state.get("signal_builder_preview_label") or saved_name,
+                                "run_at": st.session_state.get("signal_builder_preview_run_at") or datetime.now(UTC).isoformat(),
+                                "duration_seconds": None,
+                                "config_json": st.session_state.get("signal_builder_preview_config_json") or json.dumps(parsed_config, sort_keys=True),
+                                "rows": current_preview_rows,
+                                "components": st.session_state.get("signal_builder_preview_components") or {},
+                            },
+                        )
                     st.session_state.signal_builder_pending_selection = f"{saved_id}: {saved_name}"
                     st.session_state.signal_builder_force_reload = True
                     st.session_state.signal_builder_flash = f"Signal saved: {saved_name}"
@@ -1285,44 +1727,101 @@ def _render_signal_builder() -> None:
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Could not save signal: {exc}")
+    with action_mid:
+        preview_clicked = st.button("Preview rankings", use_container_width=True, disabled=preview_running)
+        if preview_clicked:
+            st.session_state.signal_builder_preview_running = True
+            st.session_state.signal_builder_cancel_preview = False
+            preview_running = True
     with action_right:
-        if st.button("Preview rankings", use_container_width=True):
-            try:
-                parsed_config = json.loads(config_text) if use_advanced_json else generated_config
-                preview_row = {
-                    "id": selected_row["id"] if selected_row else 0,
-                    "name": signal_name.strip() or "Preview",
-                    "config": parsed_config,
-                    "enabled": enabled,
-                }
-                results = score_signal(database, preview_row, store=False)
-                preview = pd.DataFrame(
-                    [
-                        {
-                            "symbol": item.symbol,
-                            "score": item.score,
-                            "eligible": item.eligible,
-                            "trading_date": item.trading_date,
-                            "close": item.close,
-                            "message": item.message,
-                        }
-                        for item in results
-                    ]
-                )
-                st.dataframe(preview, use_container_width=True, hide_index=True)
-                if results:
-                    detail_symbol = st.selectbox(
-                        "Preview component breakdown",
-                        [item.symbol for item in results[:25]],
-                    )
-                    selected_result = next(item for item in results if item.symbol == detail_symbol)
-                    st.dataframe(
-                        pd.DataFrame([component.__dict__ for component in selected_result.components]),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-            except Exception as exc:
-                st.error(f"Preview failed: {exc}")
+        if preview_running:
+            if st.button("Cancel preview", key="cancel_preview_button", use_container_width=True):
+                st.session_state.signal_builder_cancel_preview = True
+                st.warning("Preview cancellation requested. If a database read is already in progress, it will stop after that step finishes.")
+
+    if preview_clicked:
+        try:
+            parsed_config = json.loads(config_text) if use_advanced_json else generated_config
+            preview_row = {
+                "id": selected_row["id"] if selected_row else 0,
+                "name": signal_name.strip() or "Preview",
+                "config": parsed_config,
+                "enabled": enabled,
+            }
+            results, duration = _preview_signal_with_progress(preview_row)
+            payload = _preview_payload_from_results(
+                results=results,
+                label=signal_name.strip() or "Preview",
+                config=parsed_config,
+                duration_seconds=duration,
+            )
+            _save_signal_preview_payload(preview_storage_key, payload)
+            _hydrate_signal_builder_preview_state(payload)
+        except Exception as exc:
+            st.error(f"Preview failed: {exc}")
+        finally:
+            st.session_state.signal_builder_preview_running = False
+            st.session_state.signal_builder_cancel_preview = False
+
+    preview_rows = st.session_state.get("signal_builder_preview_rows") or []
+    preview_components = st.session_state.get("signal_builder_preview_components") or {}
+    if preview_rows:
+        preview_run_at = _format_timestamp(st.session_state.get("signal_builder_preview_run_at"))
+        title = f"Preview rankings: {st.session_state.get('signal_builder_preview_label', 'Preview')}"
+        if preview_run_at:
+            title += f" · Run at {preview_run_at}"
+        st.markdown(f"#### {title}")
+        current_config_json = json.dumps(json.loads(config_text) if use_advanced_json else generated_config, sort_keys=True)
+        if st.session_state.get("signal_builder_preview_config_json") and st.session_state.get("signal_builder_preview_config_json") != current_config_json:
+            st.caption("This preview was run before the latest unsaved field changes. Run Preview rankings again to refresh it.")
+        preview = pd.DataFrame(preview_rows)
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+        detail_options = [str(row["symbol"]) for row in preview_rows[:25]]
+        if detail_options:
+            detail_symbol = st.selectbox(
+                "Preview component breakdown",
+                detail_options,
+                key="signal_builder_preview_detail_symbol",
+            )
+            st.dataframe(
+                _display_component_breakdown_frame(preview_components.get(detail_symbol, [])),
+                use_container_width=True,
+                hide_index=True,
+            )
+        if st.button("Clear preview", use_container_width=True):
+            database.set_app_setting(preview_storage_key, None)
+            _clear_signal_builder_preview_state()
+            st.rerun()
+
+    st.markdown("#### Signal schedule")
+    if selected_row:
+        signal_id = int(selected_row["id"])
+        _render_scheduler_form(
+            key_prefix=f"signal_{signal_id}",
+            label=str(selected_row["name"]),
+            schedule=get_signal_schedule(database, signal_id),
+            due=is_signal_due(database, signal_id),
+            last_run=_app_setting(f"signals.{signal_id}.last_scheduled_run_at", None),
+            save_callback=lambda config, sid=signal_id: save_signal_schedule(database, sid, config),
+        )
+        if st.button(
+            "Test alert",
+            type="primary",
+            use_container_width=True,
+            help=(
+                "Refreshes Massive snapshot data for this signal, scores it, and sends a compact top-10 digest. "
+                "If ALERT_DRY_RUN=true, it records a dry-run delivery instead of sending Telegram."
+            ),
+        ):
+            with st.spinner("Scoring signal and sending sample alert..."):
+                result = run_signal_test_alert(database, settings, signal_id)
+            if result.status == "success":
+                st.success(result.message)
+            else:
+                st.error(result.message)
+            st.cache_data.clear()
+    else:
+        st.info("Save the signal first to enable scheduling and Test alert.")
 
     st.markdown("#### Latest saved scores")
     latest_scores = read_frame(
@@ -1338,6 +1837,20 @@ def _render_signal_builder() -> None:
         st.info("No saved scores yet. Run a signal from the CLI or preview/save first.")
     else:
         st.dataframe(_format_timestamps(latest_scores), use_container_width=True, hide_index=True)
+
+
+def _latest_scan_cycle_status() -> dict[str, object] | None:
+    rows = database.query(
+        """
+        SELECT started_at, finished_at, status, snapshots_fetched, symbols_filtered,
+               symbols_scored, alerts_created, deliveries_attempted, delivered,
+               duration_seconds, message
+        FROM scan_cycle_runs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    )
+    return dict(rows[0]) if rows else None
 
 
 def _render_notifications() -> None:
@@ -1359,6 +1872,37 @@ def _render_notifications() -> None:
             "Telegram is not fully configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in `.env`."
         )
 
+    st.markdown("#### Pipeline status")
+    snapshot_status = _latest_snapshot_status()
+    history_status = database.market_snapshot_history_status()
+    latest_cycle = _latest_scan_cycle_status()
+    status_cols = st.columns(5)
+    status_cols[0].metric("Latest snapshot", _format_timestamp(snapshot_status.get("latest_snapshot_at")) or "—")
+    status_cols[1].metric("History rows", f"{int(history_status.get('count') or 0):,}")
+    status_cols[2].metric("Last cycle", _format_timestamp(latest_cycle.get("started_at")) if latest_cycle else "—")
+    status_cols[3].metric("Scored", f"{int(latest_cycle.get('symbols_scored') or 0):,}" if latest_cycle else "—")
+    status_cols[4].metric("Delivered", f"{int(latest_cycle.get('delivered') or 0):,}" if latest_cycle else "—")
+    if latest_cycle:
+        st.caption(
+            "Latest full cycle: "
+            f"status={latest_cycle.get('status')}, "
+            f"snapshots={int(latest_cycle.get('snapshots_fetched') or 0):,}, "
+            f"filtered={int(latest_cycle.get('symbols_filtered') or 0):,}, "
+            f"alerts={int(latest_cycle.get('alerts_created') or 0):,}, "
+            f"deliveries={int(latest_cycle.get('deliveries_attempted') or 0):,}, "
+            f"duration={float(latest_cycle.get('duration_seconds') or 0):.2f}s. "
+            f"{latest_cycle.get('message') or ''}"
+        )
+        if float(latest_cycle.get("duration_seconds") or 0) > 720:
+            st.warning("The latest scan cycle exceeded 12 minutes. Reduce SCAN_MAX_SYMBOLS or tighten filters before running every 15 minutes.")
+    st.info(
+        "For 15-minute notifications, use a full scan cycle. It fetches a fresh snapshot, filters symbols, scores enabled signals, then evaluates and sends/queues alerts. "
+        "Alert scan only reads existing saved scores and does not fetch or process new market data."
+    )
+
+    st.markdown("#### Pipeline actions")
+    if not settings.massive_api_key:
+        st.warning("MASSIVE_API_KEY is missing. Full scan cycle requires API access.")
     action_left, action_middle, action_right = st.columns(3)
     with action_left:
         if st.button("Seed alert rules", use_container_width=True):
@@ -1377,15 +1921,146 @@ def _render_notifications() -> None:
                 st.error("Telegram test failed. Check delivery history.")
             st.cache_data.clear()
     with action_right:
-        if st.button("Run alert scan", use_container_width=True):
+        if st.button("Run alert scan only", use_container_width=True):
             result = scan_alerts(database, settings)
             st.success(
-                "Alert scan complete: "
+                "Alert scan complete from existing saved scores: "
                 f"{result.alerts_created} alerts, {result.queued} queued, "
-                f"{result.deliveries_attempted} deliveries, "
-                f"dry_run={result.dry_run}"
+                f"{result.deliveries_attempted} deliveries, dry_run={result.dry_run}"
             )
             st.cache_data.clear()
+
+    with st.expander("Run/test full 15-minute scan cycle", expanded=False):
+        st.caption("This is the production-style path: fetch snapshot → filter → score → alert scan → Telegram/dry-run.")
+        cycle_cols = st.columns([1, 1, 2])
+        cycle_max_symbols = cycle_cols[0].number_input(
+            "Max symbols",
+            min_value=1,
+            value=int(settings.scan_max_symbols),
+            step=50,
+            help="Use a small value like 25–50 for safe tests; production can use SCAN_MAX_SYMBOLS.",
+        )
+        cycle_force = cycle_cols[1].checkbox(
+            "Force outside market hours",
+            value=False,
+            help="Use only for testing. Normal production cycles should respect market hours.",
+        )
+        cycle_symbols_text = cycle_cols[2].text_input(
+            "Optional tickers",
+            value="",
+            help="Comma-separated symbols for a tiny test cycle, e.g. AAPL,MSFT,NVDA.",
+        )
+        cycle_a, cycle_b, cycle_c = st.columns(3)
+        requested_symbols = [item.strip().upper() for item in cycle_symbols_text.split(",") if item.strip()] or None
+        with cycle_a:
+            if st.button("Dry run full cycle", use_container_width=True):
+                try:
+                    with scan_cycle_lock(settings.scan_lock_path):
+                        result = run_scan_cycle(
+                            database,
+                            MassiveClient(
+                                settings.massive_api_key,
+                                base_url=settings.massive_base_url,
+                                requests_per_minute=settings.requests_per_minute,
+                                timeout_seconds=settings.http_timeout_seconds,
+                            ),
+                            settings,
+                            dry_run=True,
+                            max_symbols=int(cycle_max_symbols),
+                            symbols=requested_symbols,
+                            benchmark=True,
+                            force=cycle_force,
+                        )
+                    st.success(
+                        f"Dry-run cycle complete: snapshots={result.snapshots_fetched:,}, filtered={result.symbols_filtered:,}, "
+                        f"scored={result.symbols_scored:,}, alerts={result.alerts.alerts_created}, queued={result.alerts.queued}, "
+                        f"history_rows={result.snapshot_history_rows:,}, duration={result.duration_seconds:.2f}s"
+                    )
+                    st.cache_data.clear()
+                except Exception as exc:
+                    st.error(f"Dry-run full cycle failed: {exc}")
+        with cycle_b:
+            if st.button("Real Telegram full cycle", use_container_width=True):
+                try:
+                    with scan_cycle_lock(settings.scan_lock_path):
+                        result = run_scan_cycle(
+                            database,
+                            MassiveClient(
+                                settings.massive_api_key,
+                                base_url=settings.massive_base_url,
+                                requests_per_minute=settings.requests_per_minute,
+                                timeout_seconds=settings.http_timeout_seconds,
+                            ),
+                            settings,
+                            dry_run=False,
+                            max_symbols=int(cycle_max_symbols),
+                            symbols=requested_symbols,
+                            benchmark=True,
+                            force=cycle_force,
+                        )
+                    st.success(
+                        f"Real cycle complete: snapshots={result.snapshots_fetched:,}, filtered={result.symbols_filtered:,}, "
+                        f"scored={result.symbols_scored:,}, alerts={result.alerts.alerts_created}, delivered={result.alerts.delivered}, "
+                        f"duration={result.duration_seconds:.2f}s"
+                    )
+                    st.cache_data.clear()
+                except Exception as exc:
+                    st.error(f"Real full cycle failed: {exc}")
+        with cycle_c:
+            if st.button("Full cycle without Telegram", use_container_width=True):
+                try:
+                    with scan_cycle_lock(settings.scan_lock_path):
+                        result = run_scan_cycle(
+                            database,
+                            MassiveClient(
+                                settings.massive_api_key,
+                                base_url=settings.massive_base_url,
+                                requests_per_minute=settings.requests_per_minute,
+                                timeout_seconds=settings.http_timeout_seconds,
+                            ),
+                            settings,
+                            max_symbols=int(cycle_max_symbols),
+                            symbols=requested_symbols,
+                            skip_telegram=True,
+                            benchmark=True,
+                            force=cycle_force,
+                        )
+                    st.success(
+                        f"Cycle complete without Telegram: filtered={result.symbols_filtered:,}, scored={result.symbols_scored:,}, "
+                        f"alerts={result.alerts.alerts_created}, duration={result.duration_seconds:.2f}s"
+                    )
+                    st.cache_data.clear()
+                except Exception as exc:
+                    st.error(f"No-Telegram full cycle failed: {exc}")
+
+    with st.expander("Send sample alert", expanded=False):
+        definitions = database.list_signal_definitions()
+        signal_names = [str(item["name"]) for item in definitions]
+        if not signal_names:
+            st.info("Create a signal before sending sample alerts.")
+        else:
+            sample_cols = st.columns([1.4, 0.8, 0.8, 0.8])
+            sample_signal = sample_cols[0].selectbox("Signal", signal_names, key="sample_alert_signal")
+            sample_symbol = sample_cols[1].text_input("Symbol", value="AAPL", key="sample_alert_symbol").upper().strip()
+            sample_direction = sample_cols[2].selectbox("Direction", ["BUY", "SELL"], key="sample_alert_direction")
+            sample_real_send = sample_cols[3].checkbox("Real send", value=False, help="Off records a dry-run delivery only.")
+            if st.button("Send sample alert", use_container_width=True):
+                try:
+                    sent = send_sample_alert(
+                        database,
+                        settings,
+                        signal_name=sample_signal,
+                        symbol=sample_symbol,
+                        direction=sample_direction,
+                        dry_run=not sample_real_send,
+                    )
+                    if sample_real_send:
+                        st.success("Sample alert delivered." if sent else "Sample alert attempted; check delivery history for failure details.")
+                    else:
+                        st.info("Recorded sample alert in dry-run mode.")
+                    st.cache_data.clear()
+                except Exception as exc:
+                    st.error(f"Sample alert failed: {exc}")
 
     st.markdown("#### Alert rules")
     missing_rule_signals = read_frame(
@@ -1534,6 +2209,123 @@ def _render_notifications() -> None:
         st.dataframe(_format_timestamps(deliveries), use_container_width=True, hide_index=True)
 
 
+def _weekday_labels() -> list[tuple[str, int]]:
+    return [("M", 0), ("Tu", 1), ("W", 2), ("Th", 3), ("F", 4), ("Sa", 5), ("Su", 6)]
+
+
+def _render_scheduler_form(
+    *,
+    key_prefix: str,
+    label: str,
+    schedule: dict[str, object],
+    due: bool,
+    last_run: object,
+    save_callback: object,
+) -> None:
+    unit_labels = {
+        "minutes": "minutes",
+        "hours": "hours",
+        "days": "days",
+        "business_days": "business days",
+        "weeks": "weeks",
+    }
+    st.markdown("##### Scheduler")
+    cols = st.columns([0.7, 0.8, 1.1, 0.8, 0.8, 0.8])
+    enabled = cols[0].checkbox("Enabled", value=bool(schedule.get("enabled")), key=f"{key_prefix}_enabled")
+    amount = cols[1].number_input(
+        "Every",
+        min_value=1,
+        max_value=10000,
+        value=max(int(schedule.get("frequency_amount") or 1), 1),
+        step=1,
+        key=f"{key_prefix}_amount",
+    )
+    unit = cols[2].selectbox(
+        "Unit",
+        SCHEDULE_UNITS,
+        index=SCHEDULE_UNITS.index(str(schedule.get("frequency_unit")))
+        if str(schedule.get("frequency_unit")) in SCHEDULE_UNITS
+        else 2,
+        format_func=lambda item: unit_labels.get(str(item), str(item)),
+        key=f"{key_prefix}_unit",
+    )
+    start_time = cols[3].text_input(
+        "Start",
+        value=str(schedule.get("start_time") or "09:45"),
+        help="Earliest local time the scheduler may run.",
+        key=f"{key_prefix}_start_time",
+    )
+    end_time = cols[4].text_input(
+        "End",
+        value=str(schedule.get("end_time") or "16:00"),
+        disabled=unit != "minutes",
+        help="Only used for minute schedules. The scheduler will not run after this local time.",
+        key=f"{key_prefix}_end_time",
+    )
+    timezone = str(schedule.get("timezone") or settings.alert_default_timezone)
+    notify = cols[5].checkbox(
+        "Telegram",
+        value=bool(schedule.get("notify_telegram")),
+        help="Send Telegram delivery/dry-run rows after completion or failure.",
+        key=f"{key_prefix}_notify",
+    )
+    weekdays = list(schedule.get("weekdays") or [0, 1, 2, 3, 4])
+    if unit == "minutes":
+        st.caption("Minute schedule days")
+        weekday_columns = st.columns(7)
+        selected_weekdays: list[int] = []
+        for index, (weekday_label, weekday_value) in enumerate(_weekday_labels()):
+            checked = weekday_columns[index].checkbox(
+                weekday_label,
+                value=int(weekday_value) in {int(item) for item in weekdays},
+                key=f"{key_prefix}_weekday_{weekday_value}",
+            )
+            if checked:
+                selected_weekdays.append(int(weekday_value))
+    else:
+        selected_weekdays = weekdays
+    if st.button(f"Save {label} schedule", use_container_width=True, key=f"{key_prefix}_save_schedule"):
+        save_callback(
+            {
+                "enabled": enabled,
+                "frequency_amount": int(amount),
+                "frequency_unit": unit,
+                "start_time": start_time,
+                "end_time": end_time,
+                "weekdays": selected_weekdays,
+                "timezone": timezone,
+                "notify_telegram": notify,
+            }
+        )
+        st.success(f"{label} schedule saved.")
+        st.rerun()
+    weekday_text = ""
+    if str(schedule.get("frequency_unit")) == "minutes":
+        selected = {int(item) for item in list(schedule.get("weekdays") or [])}
+        weekday_text = " · days " + ",".join(label for label, value in _weekday_labels() if value in selected)
+    st.caption(
+        f"Saved schedule: {'enabled' if bool(schedule.get('enabled')) else 'disabled'} · "
+        f"every {int(schedule.get('frequency_amount') or 1)} {unit_labels.get(str(schedule.get('frequency_unit')), str(schedule.get('frequency_unit')))} · "
+        f"start {schedule.get('start_time')} · "
+        f"end {schedule.get('end_time') if str(schedule.get('frequency_unit')) == 'minutes' else 'n/a'} "
+        f"{schedule.get('timezone')}{weekday_text} · "
+        f"Telegram {'on' if bool(schedule.get('notify_telegram')) else 'off'} · "
+        f"last scheduled run {_format_timestamp(last_run) or 'never'} · "
+        f"{'due now' if due else 'not due'}"
+    )
+
+
+def _render_service_scheduler(service_key: str, label: str) -> None:
+    _render_scheduler_form(
+        key_prefix=f"service_{service_key}",
+        label=label,
+        schedule=get_service_schedule(database, service_key),
+        due=is_service_due(database, service_key),
+        last_run=_app_setting(f"services.{service_key}.last_scheduled_run_at", None),
+        save_callback=lambda config: save_service_schedule(database, service_key, config),
+    )
+
+
 def _render_services() -> None:
     st.subheader("Services")
     st.caption("Run bounded maintenance/data-ingestion jobs without blocking the dashboard for a full-universe sync.")
@@ -1549,6 +2341,8 @@ def _render_services() -> None:
         )
         if not settings.massive_api_key:
             st.warning("MASSIVE_API_KEY is missing. Market snapshot ingestion requires API access.")
+
+        _render_service_scheduler("snapshot", "market snapshot")
 
         snapshot_status = _latest_snapshot_status()
         snapshot_status_cols = st.columns(3)
@@ -1732,6 +2526,8 @@ def _render_services() -> None:
         )
         if not settings.massive_api_key:
             st.warning("MASSIVE_API_KEY is missing. Historical data ingestion requires API access.")
+
+        _render_service_scheduler("historical", "historical data")
 
         historical_scope_options = ["Stocks universe", "Selected lists", "Typed tickers", "Lists + typed tickers"]
         historical_scope = st.radio(
@@ -1983,6 +2779,8 @@ def _render_services() -> None:
         if not settings.massive_api_key:
             st.warning("MASSIVE_API_KEY is missing. Profile ingestion requires API access.")
 
+        _render_service_scheduler("profiles", "company profiles")
+
         profile_scope_options = ["Stocks universe", "Selected lists", "Typed tickers", "Lists + typed tickers"]
         scope = st.radio(
             "Run service for",
@@ -2179,6 +2977,40 @@ st.markdown(
         padding: 0.25rem 0.75rem;
         border-radius: 0.6rem;
     }
+    div.stButton > button[kind="primary"] {
+        background: #0f766e;
+        border-color: #0f766e;
+        color: white;
+    }
+    div.stButton > button[kind="primary"]:hover {
+        background: #0d9488;
+        border-color: #0d9488;
+        color: white;
+    }
+    div[data-baseweb="tag"] {
+        background-color: #dbeafe;
+        color: #1e3a8a;
+    }
+    .st-key-delete_signal_button button {
+        background: #dc2626 !important;
+        border-color: #dc2626 !important;
+        color: white !important;
+    }
+    .st-key-delete_signal_button button:hover {
+        background: #b91c1c !important;
+        border-color: #b91c1c !important;
+        color: white !important;
+    }
+    .st-key-cancel_preview_button button {
+        background: #dc2626 !important;
+        border-color: #dc2626 !important;
+        color: white !important;
+    }
+    .st-key-cancel_preview_button button:hover {
+        background: #b91c1c !important;
+        border-color: #b91c1c !important;
+        color: white !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -2198,22 +3030,26 @@ for index, option in enumerate(page_options):
 selected_page = st.session_state.main_navigation
 
 if selected_page == "Market data":
-    latest = _latest_watchlist()
-    if latest.empty:
+    selected_view = _select_market_view()
+    view_title = "Stocks universe"
+    view_caption = "General list of active symbols."
+    requested_market_symbols: set[str] | None = None
+    member_count = 0
+    if selected_view["kind"] == "list" and selected_view["list_id"] is not None:
+        list_id = int(selected_view["list_id"])
+        requested_market_symbols = set(database.symbols_in_list(list_id))
+        member_count = len(requested_market_symbols)
+        view_title = f"List: {selected_view['label']}"
+
+    latest = _latest_watchlist(requested_market_symbols)
+    visible_latest = latest
+    if selected_view["kind"] == "list" and selected_view["list_id"] is not None:
+        view_caption = f"{member_count} saved symbol(s); {len(visible_latest)} currently visible with market data."
+
+    if latest.empty and requested_market_symbols is None:
         st.warning("No database data yet. Run `stock-notifier fetch-daily` or a backfill first.")
     else:
-        selected_view = _select_market_view()
-        visible_latest = latest
-        view_title = "Stocks universe"
-        view_caption = "General list of active symbols."
-        if selected_view["kind"] == "list" and selected_view["list_id"] is not None:
-            list_id = int(selected_view["list_id"])
-            members = set(database.symbols_in_list(list_id))
-            visible_latest = latest.loc[latest["ticker"].isin(members)].copy()
-            view_title = f"List: {selected_view['label']}"
-            view_caption = f"{len(members)} saved symbol(s); {len(visible_latest)} currently visible with market data."
-
-        available = visible_latest.loc[visible_latest["close"].notna(), "ticker"].tolist()
+        available = visible_latest.loc[visible_latest["close"].notna(), "ticker"].tolist() if not visible_latest.empty else []
         if "market_selected_symbol" not in st.session_state or (
             available and st.session_state.market_selected_symbol not in available
         ):
@@ -2226,16 +3062,16 @@ if selected_page == "Market data":
             st.info("No symbols to show for this view yet. Add symbols in the Lists tab or refresh market data.")
         else:
             st.dataframe(
-                visible_latest,
+                _display_market_data_frame(visible_latest),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "close": st.column_config.NumberColumn(format="$%.2f"),
-                    "previous_close": st.column_config.NumberColumn("Previous close", format="$%.2f"),
-                    "volume": st.column_config.NumberColumn(format="%.0f"),
-                    "daily_change_pct": st.column_config.NumberColumn("Change %", format="%.2f%%"),
-                    "dollar_volume": st.column_config.NumberColumn("Dollar volume", format="$%.0f"),
-                    "market_cap": st.column_config.NumberColumn("Market cap", format="$%.0f"),
+                    "Close": st.column_config.NumberColumn(format="$%.2f"),
+                    "Previous close": st.column_config.NumberColumn(format="$%.2f"),
+                    "Volume": st.column_config.NumberColumn(format="%.0f"),
+                    "Daily change %": st.column_config.NumberColumn(format="%.2f%%"),
+                    "Dollar volume": st.column_config.NumberColumn(format="$%.0f"),
+                    "Market cap": st.column_config.NumberColumn(format="$%.0f"),
                 },
             )
 
@@ -2258,6 +3094,7 @@ if selected_page == "Market data":
                     with match_columns[index % len(match_columns)]:
                         if st.button(label, key=f"symbol_match_{ticker}", use_container_width=True):
                             st.session_state.market_selected_symbol = ticker
+                            st.session_state.market_chart_loaded_symbol = None
                             st.rerun()
 
             selected = st.session_state.market_selected_symbol
@@ -2273,30 +3110,39 @@ if selected_page == "Market data":
                     + (f" · {change:+.2f}%" if pd.notna(change) else "")
                 )
 
-            range_options = ["Intraday", "5D", "1W", "1M", "3M", "6M", "1Y"]
-            selected_range = st.radio(
-                "Range",
-                range_options,
-                horizontal=True,
-                index=3,
-                label_visibility="collapsed",
-            )
-            history = read_frame(
-                """
-                SELECT trading_date, open, high, low, close, volume
-                FROM daily_bars WHERE symbol = ? ORDER BY trading_date
-                """,
-                (selected,),
-            )
-            history["trading_date"] = pd.to_datetime(history["trading_date"])
-            visible_history = _history_for_range(history, selected_range)
-            if selected_range == "Intraday":
-                st.info("Intraday data is not enabled yet, so this shows the latest available daily bar for now.")
-            _render_price_volume_chart(visible_history, selected)
-            st.markdown(
-                f"[TradingView](https://www.tradingview.com/chart/?symbol={selected}) · "
-                f"[Yahoo Finance](https://finance.yahoo.com/quote/{selected})"
-            )
+            chart_loaded = st.session_state.get("market_chart_loaded_symbol") == selected
+            chart_columns = st.columns([1, 3])
+            with chart_columns[0]:
+                if st.button(f"Load chart for {selected}", type="primary", use_container_width=True):
+                    st.session_state.market_chart_loaded_symbol = selected
+                    chart_loaded = True
+            with chart_columns[1]:
+                st.caption(
+                    "The market table loads first. Charts are loaded separately and cached per symbol, "
+                    "so range changes are faster after the first chart load."
+                )
+
+            if chart_loaded:
+                range_options = ["Intraday", "5D", "1W", "1M", "3M", "6M", "1Y", "3Y"]
+                selected_range = st.radio(
+                    "Range",
+                    range_options,
+                    horizontal=True,
+                    index=3,
+                    label_visibility="collapsed",
+                )
+                with st.spinner(f"Loading chart history for {selected}..."):
+                    history = _symbol_history(str(selected), _db_cache_key())
+                    visible_history = _history_for_range(history, selected_range)
+                if selected_range == "Intraday":
+                    st.info("Intraday data is not enabled yet, so this shows the latest available daily bar for now.")
+                _render_price_volume_chart(visible_history, selected)
+                st.markdown(
+                    f"[TradingView](https://www.tradingview.com/chart/?symbol={selected}) · "
+                    f"[Yahoo Finance](https://finance.yahoo.com/quote/{selected})"
+                )
+            else:
+                st.info("Chart not loaded yet. Click the button above to load history for the selected symbol.")
         elif not visible_latest.empty:
             st.info("No chartable symbols found in the selected view.")
 
@@ -2314,6 +3160,27 @@ if selected_page == "Services":
 
 if selected_page == "Latest runs":
     st.subheader("Latest runs")
+    st.caption("Times are shown in US Eastern time.")
+
+    st.markdown("#### Notifications sent")
+    notification_runs = read_frame(
+        """
+        SELECT d.created_at, d.channel_type, d.status, d.alert_id,
+               COALESCE(a.direction, '') AS direction,
+               COALESCE(a.symbol, '') AS symbol,
+               COALESCE(a.signal_name, '') AS signal_name,
+               d.error_text, d.request_json, d.response_json
+        FROM notification_deliveries d
+        LEFT JOIN alerts a ON a.id=d.alert_id
+        ORDER BY d.id DESC
+        LIMIT 30
+        """
+    )
+    if notification_runs.empty:
+        st.info("No Telegram notifications recorded yet.")
+    else:
+        st.dataframe(_display_notification_deliveries(notification_runs), use_container_width=True, hide_index=True)
+
     all_runs = read_frame(
         """
         SELECT started_at, finished_at, 'fetch' AS run_group, run_type AS run_name,
@@ -2342,7 +3209,7 @@ if selected_page == "Latest runs":
     if all_runs.empty:
         st.info("No runs logged yet.")
     else:
-        st.dataframe(_format_timestamps(all_runs), use_container_width=True, hide_index=True)
+        st.dataframe(_display_history_frame(all_runs), use_container_width=True, hide_index=True)
 
     st.subheader("Fetch run history")
     logs = read_frame(
@@ -2355,7 +3222,7 @@ if selected_page == "Latest runs":
     if logs.empty:
         st.info("No fetch runs logged yet.")
     else:
-        st.dataframe(_format_timestamps(logs), use_container_width=True, hide_index=True)
+        st.dataframe(_display_history_frame(logs), use_container_width=True, hide_index=True)
 
     st.subheader("Signal run history")
     signal_runs = read_frame(
@@ -2367,7 +3234,7 @@ if selected_page == "Latest runs":
     if signal_runs.empty:
         st.info("No signal runs logged yet.")
     else:
-        st.dataframe(_format_timestamps(signal_runs), use_container_width=True, hide_index=True)
+        st.dataframe(_display_history_frame(signal_runs), use_container_width=True, hide_index=True)
 
     st.subheader("Service run history")
     service_runs = read_frame(
@@ -2381,7 +3248,7 @@ if selected_page == "Latest runs":
     if service_runs.empty:
         st.info("No service runs logged yet.")
     else:
-        st.dataframe(_format_timestamps(service_runs), use_container_width=True, hide_index=True)
+        st.dataframe(_display_history_frame(service_runs), use_container_width=True, hide_index=True)
 
     st.subheader("Scan cycle history")
     scan_cycles = read_frame(
@@ -2395,4 +3262,4 @@ if selected_page == "Latest runs":
     if scan_cycles.empty:
         st.info("No intraday scan cycles logged yet.")
     else:
-        st.dataframe(_format_timestamps(scan_cycles), use_container_width=True, hide_index=True)
+        st.dataframe(_display_history_frame(scan_cycles), use_container_width=True, hide_index=True)

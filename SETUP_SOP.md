@@ -1,7 +1,8 @@
 # Stock Signal Notifier — Setup and Operating SOP
 
 This runbook takes the project from a laptop checkout to a tested Oracle Cloud deployment.
-Phase 1 stores end-of-day US bars. Scoring and Telegram alerts deliberately remain Phase 2/3.
+The current application includes end-of-day ingestion, historical backfill, full-market snapshots,
+configurable scoring, Telegram alerts, scheduled scan cycles, and dashboard-managed service jobs.
 
 ## 1. Local smoke test
 
@@ -91,19 +92,36 @@ run `partial`, not fatal. Per-symbol backfill errors are isolated and logged.
 
 ```bash
 sudo cp /opt/stock-notifier/deploy/stock-notifier-*.service /etc/systemd/system/
-sudo cp /opt/stock-notifier/deploy/stock-notifier-fetch.timer /etc/systemd/system/
+sudo cp /opt/stock-notifier/deploy/stock-notifier-*.timer /etc/systemd/system/
 sudo cp /opt/stock-notifier/deploy/Caddyfile /etc/caddy/Caddyfile
 sudo systemctl daemon-reload
 sudo systemctl enable --now stock-notifier-dashboard.service
 sudo systemctl enable --now stock-notifier-fetch.timer
 sudo systemctl restart caddy
 systemctl list-timers stock-notifier-fetch.timer
+# Enable only after manual dry-run scan cycles are fast and correct:
+# sudo systemctl enable --now stock-notifier-scan-cycle.timer
+# systemctl list-timers stock-notifier-scan-cycle.timer
+# Enable only once service schedules are configured in the dashboard:
+# sudo systemctl enable --now stock-notifier-services-scheduler.timer
+# systemctl list-timers stock-notifier-services-scheduler.timer
 curl -I http://127.0.0.1:8501
 curl -I http://SERVER_IP
 ```
 
-The timer runs weekdays at 22:15 UTC, safely after the US regular close in EST and EDT. `Persistent`
+The fetch timer runs weekdays at 22:15 UTC, safely after the US regular close in EST and EDT. `Persistent`
 means a missed run is triggered after reboot. The command's date lookback handles market holidays.
+
+The scan-cycle timer runs every 15 minutes on weekdays and calls `stock-notifier run-scan-cycle --benchmark`.
+Keep it disabled until `stock-notifier run-scan-cycle --dry-run --benchmark --max-symbols 50 --force` works manually and Latest runs shows acceptable duration. With `SCAN_MARKET_HOURS_ONLY=true`, off-hours timer runs skip instead of fetching/scoring.
+
+The services scheduler timer wakes every 5 minutes and calls `stock-notifier services-run-due`. Configure service schedules in the Services tab and signal schedules in Signal Builder. The scheduler uses the saved service/signal settings and can optionally send Telegram completion/error notifications or compact signal digests. Test manually with `stock-notifier services-run-due --service snapshot --force` or `stock-notifier services-run-due --signal SIGNAL_ID --force`.
+
+Install and enable the services scheduler timer only once, unless the files in `deploy/` change or
+the timer was disabled. Creating or editing service/signal schedules in the dashboard updates SQLite settings; it
+does not require another `sudo cp`, `daemon-reload`, or `enable --now`.
+
+Scheduled signal runs are designed for 15-minute delayed Massive data. Before scoring, they check whether at least 95% of the signal universe has snapshots fetched in the last 14 minutes. If yes, they reuse the existing snapshot data; otherwise they call Massive's full-market snapshot endpoint once and update only the signal universe. Telegram digests show the top 10 signal results with score, price, percent change, volume, and TradingView/Yahoo links.
 
 For HTTPS, point a DNS A record at the reserved IP, replace `:80` in the Caddyfile with the hostname,
 and reload with `sudo systemctl reload caddy`. Caddy obtains the certificate automatically.
@@ -112,6 +130,8 @@ and reload with `sudo systemctl reload caddy`. Caddy obtains the certificate aut
 
 ```bash
 systemctl status stock-notifier-dashboard.service stock-notifier-fetch.timer
+systemctl status stock-notifier-services-scheduler.timer --no-pager
+journalctl -u stock-notifier-services-scheduler.service -n 100 --no-pager
 journalctl -u stock-notifier-fetch.service -n 100 --no-pager
 journalctl -u stock-notifier-dashboard.service -n 100 --no-pager
 sudo -u stocknotifier sqlite3 /opt/stock-notifier/data/stock_notifier.db \
@@ -121,8 +141,12 @@ sudo -u stocknotifier sqlite3 /opt/stock-notifier/data/stock_notifier.db \
 - A `success` or explainable `partial` entry should appear each US trading day.
 - Back up SQLite with its online backup command, not a raw copy while the dashboard is running:
   `sqlite3 data/stock_notifier.db ".backup data/backup-$(date +%F).db"`.
-- Before updating, back up the DB and `.env`; deploy code with the same `rsync` command, reinstall
-  requirements, run `stock-notifier init-db`, then restart the dashboard.
+- Before updating, back up the DB and `.env`; deploy code without replacing the server database,
+  reinstall requirements if dependencies changed, run `stock-notifier init-db`, then restart the dashboard.
+- If a deployment adds a new package folder such as `src/stock_notifier/services`, create the folder
+  on the server before copying individual files into it.
+- If a deployment changes systemd service/timer files, copy the changed files to `/etc/systemd/system/`
+  and run `sudo systemctl daemon-reload`. Normal dashboard schedule edits do not need this.
 - Rotate the Massive key immediately if it appears in shell history, logs, screenshots, or Git.
 - Apply Ubuntu security updates monthly and reboot when `/var/run/reboot-required` exists.
 
@@ -139,22 +163,20 @@ sudo -u stocknotifier sqlite3 /opt/stock-notifier/data/stock_notifier.db \
 
 ## 8. Complete delivery breakdown
 
-1. **Phase 1A — foundation (this scaffold):** local tests, Oracle VM, secrets, SQLite, 51-symbol
-   watchlist, grouped EOD ingestion, historical backfill, dashboard, timer, proxy, logs and backups.
-2. **Phase 1B — acceptance:** seven consecutive trading-day runs; restore a DB backup; verify reboot
-   recovery; add an external uptime check; restrict SSH to your IP and enable OCI account MFA.
-3. **Phase 2 — scoring:** add at least 220 adjusted daily bars; implement indicators with explicit
-   formulas/tests; version weights and thresholds; persist every score; backtest before treating a
-   signal as actionable.
-4. **Phase 3 — notifications:** create a Telegram bot/chat; encrypt token in `.env`; edge-trigger
-   threshold crossings; add cooldown/deduplication, delivery attempts, alert history, and a daily
-   digest. Test with a dry-run notifier first.
-5. **Phase 4 — delayed intraday:** upgrade only after Phase 2/3 are stable. Add the full-market
-   snapshot provider, exchange-calendar scheduling, 15-minute bars, stale-data guards, and alert
-   freshness labels. Do not represent delayed data as real time.
-6. **Phase 5 — scale and Canada:** filter active/liquid instruments, benchmark scoring, define
-   retention, then add a separately licensed TSX provider. Keep each provider behind the same
-   interface and make exchange/date provenance explicit.
+1. **Phase 1 — foundation:** local tests, Oracle VM, secrets, SQLite, grouped EOD ingestion,
+   historical backfill, dashboard, timer, proxy, logs and backups.
+2. **Phase 2 — scoring:** configurable Signal Builder, indicator components, score/gate modes,
+   persisted signal definitions, scores, and component breakdowns.
+3. **Phase 3 — notifications:** Telegram bot/chat, dry-run mode, alert rules, dedupe/crossing
+   state, pending alerts, delivery attempts, alert history, and sample alert testing.
+4. **Phase 4 — delayed intraday:** Massive full-market snapshots, short intraday snapshot history,
+   VM-safe filtering, grouped scoring, scan-cycle runs, and 15-minute timer support.
+5. **Phase 5 — schedulers:** dashboard-managed market snapshot, historical backfill, and company
+   profile ingestion; persisted service options; per-signal scheduler controls; service/signal-run
+   logging; optional Telegram completion/error notifications and top-10 signal digests.
+6. **Phase 6 — hardening and scale:** production benchmark tuning, larger/liquid universes,
+   signal performance analytics/backtesting, richer progress/cancel behavior, and later Canadian
+   provider support.
 
 ### Phase 1 acceptance checklist
 
@@ -166,4 +188,3 @@ sudo -u stocknotifier sqlite3 /opt/stock-notifier/data/stock_notifier.db \
 - [ ] Public traffic reaches Caddy; Streamlit port 8501 is not public.
 - [ ] SQLite backup can be restored and queried.
 - [ ] Seven trading days complete without an unexplained failed run.
-

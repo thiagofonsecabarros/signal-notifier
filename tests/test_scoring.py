@@ -8,7 +8,7 @@ from stock_notifier.db import Database
 from stock_notifier.models import DailyBar, Symbol
 from stock_notifier.scoring.engine import SignalDefinition, evaluate_signal
 from stock_notifier.scoring.indicators import price_change_pct, sma, volume_ratio
-from stock_notifier.scoring.service import score_signal, seed_starter_signals
+from stock_notifier.scoring.service import score_enabled_signals_grouped, score_signal, seed_starter_signals
 
 
 def _bars(symbol: str, count: int = 260) -> list[DailyBar]:
@@ -188,3 +188,34 @@ def test_scoring_service_uses_symbol_lists_in_universe(tmp_path):
     results = score_signal(database, definition, store=False)
 
     assert [item.symbol for item in results] == ["AAPL"]
+
+
+def test_grouped_enabled_scoring_matches_individual_scoring(tmp_path):
+    database = Database(tmp_path / "notifier.db")
+    database.initialize()
+    database.sync_symbols([Symbol("AAPL", "Apple"), Symbol("MSFT", "Microsoft")])
+    database.upsert_bars([*_bars("AAPL"), *_bars("MSFT")])
+    signal_id = database.upsert_signal_definition(
+        "One Day Momentum",
+        {
+            "components": [
+                {
+                    "name": "One day momentum",
+                    "type": "price_change_pct",
+                    "mode": "score",
+                    "weight": 1,
+                    "score_min": 0,
+                    "score_max": 5,
+                    "params": {"days": 1},
+                }
+            ]
+        },
+    )
+    definition = database.get_signal_definition(signal_id)
+    assert definition is not None
+
+    individual = score_signal(database, definition, store=False)
+    grouped = score_enabled_signals_grouped(database, symbols={"AAPL", "MSFT"}, include_latest_snapshot=False)
+
+    assert [item.symbol for item in grouped["One Day Momentum"]] == [item.symbol for item in individual]
+    assert [item.score for item in grouped["One Day Momentum"]] == [item.score for item in individual]

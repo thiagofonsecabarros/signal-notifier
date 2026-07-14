@@ -4,7 +4,7 @@ import sqlite3
 import json
 from collections.abc import Iterable
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -259,6 +259,24 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_market_snapshots_volume
 ON market_snapshots(day_volume DESC, price DESC);
+
+CREATE TABLE IF NOT EXISTS market_snapshot_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL REFERENCES symbols(ticker),
+    snapshot_at TEXT NOT NULL,
+    price REAL NOT NULL,
+    percent_change REAL,
+    day_volume REAL,
+    dollar_volume REAL,
+    fetched_at TEXT NOT NULL,
+    UNIQUE(symbol, snapshot_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_snapshot_history_symbol_time
+ON market_snapshot_history(symbol, snapshot_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_market_snapshot_history_fetched
+ON market_snapshot_history(fetched_at DESC);
 
 CREATE TABLE IF NOT EXISTS scan_cycle_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -612,6 +630,66 @@ class Database:
             )
         return len(rows)
 
+    def append_market_snapshot_history(self, snapshots: Iterable[MarketSnapshot]) -> int:
+        now = datetime.now(UTC).isoformat()
+        rows = []
+        for snapshot in snapshots:
+            day_volume = snapshot.day_volume or 0
+            rows.append(
+                (
+                    snapshot.symbol,
+                    snapshot.snapshot_at.isoformat(),
+                    snapshot.price,
+                    snapshot.percent_change,
+                    snapshot.day_volume,
+                    snapshot.price * day_volume,
+                    now,
+                )
+            )
+        if not rows:
+            return 0
+        with self.connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO market_snapshot_history(
+                    symbol, snapshot_at, price, percent_change, day_volume, dollar_volume, fetched_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, snapshot_at) DO UPDATE SET
+                    price=excluded.price,
+                    percent_change=excluded.percent_change,
+                    day_volume=excluded.day_volume,
+                    dollar_volume=excluded.dollar_volume,
+                    fetched_at=excluded.fetched_at
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def prune_market_snapshot_history(self, *, keep_hours: float = 10.0) -> int:
+        cutoff = datetime.now(UTC) - timedelta(hours=max(float(keep_hours), 0.0))
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM market_snapshot_history WHERE snapshot_at < ?",
+                (cutoff.isoformat(),),
+            )
+            return int(cursor.rowcount or 0)
+
+    def market_snapshot_history_status(self) -> dict[str, Any]:
+        rows = self.query(
+            """
+            SELECT COUNT(*) AS count, MIN(snapshot_at) AS oldest_snapshot_at,
+                   MAX(snapshot_at) AS latest_snapshot_at, MAX(fetched_at) AS latest_fetched_at
+            FROM market_snapshot_history
+            """
+        )
+        return dict(rows[0]) if rows else {
+            "count": 0,
+            "oldest_snapshot_at": None,
+            "latest_snapshot_at": None,
+            "latest_fetched_at": None,
+        }
+
     def upsert_company_profile(self, profile: CompanyProfile) -> None:
         now = datetime.now(UTC).isoformat()
         with self.connect() as connection:
@@ -880,14 +958,21 @@ class Database:
         if not requested:
             return {}
         placeholders = ", ".join("?" for _ in requested)
+        row_limit = max(int(min_bars), 1)
         rows = self.query(
             f"""
+            WITH ranked AS (
+                SELECT symbol, trading_date, open, high, low, close, volume,
+                       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY trading_date DESC) AS rn
+                FROM daily_bars
+                WHERE symbol IN ({placeholders})
+            )
             SELECT symbol, trading_date, open, high, low, close, volume
-            FROM daily_bars
-            WHERE symbol IN ({placeholders})
+            FROM ranked
+            WHERE rn <= ?
             ORDER BY symbol, trading_date
             """,
-            tuple(requested),
+            tuple(requested) + (row_limit,),
         )
         grouped: dict[str, list[sqlite3.Row]] = {symbol: [] for symbol in requested}
         for row in rows:
@@ -908,7 +993,7 @@ class Database:
             )
             for row in snapshot_rows:
                 grouped[str(row["symbol"])].append(row)
-        return {symbol: values[-min_bars:] for symbol, values in grouped.items() if values}
+        return {symbol: values[-row_limit:] for symbol, values in grouped.items() if values}
 
     def active_symbols(self) -> list[str]:
         return [str(row["ticker"]) for row in self.query("SELECT ticker FROM symbols WHERE active=1 ORDER BY ticker")]
@@ -1106,9 +1191,31 @@ class Database:
                 ),
             )
 
-    def latest_scores_for_alert_rules(self) -> list[dict[str, Any]]:
+    def latest_score_for_signal_symbol(self, signal_name: str, symbol: str) -> dict[str, Any] | None:
         rows = self.query(
             """
+            SELECT id AS score_id, signal_id, signal_name, symbol, trading_date, close,
+                   score, eligible, message AS score_message, created_at AS scored_at
+            FROM signal_scores
+            WHERE lower(signal_name)=lower(?) AND symbol=? AND is_latest=1
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (signal_name, symbol.upper().strip()),
+        )
+        return dict(rows[0]) if rows else None
+
+    def latest_scores_for_alert_rules(self, signal_names: set[str] | None = None) -> list[dict[str, Any]]:
+        signal_filter = ""
+        parameters: tuple[Any, ...] = ()
+        if signal_names:
+            names = sorted({name.strip().lower() for name in signal_names if name.strip()})
+            if names:
+                placeholders = ", ".join("?" for _ in names)
+                signal_filter = f" AND lower(r.signal_name) IN ({placeholders})"
+                parameters = tuple(names)
+        rows = self.query(
+            f"""
             SELECT
                 r.id AS alert_rule_id,
                 r.signal_id,
@@ -1134,8 +1241,10 @@ class Database:
               ON lower(s.signal_name)=lower(r.signal_name)
              AND s.is_latest=1
             WHERE r.enabled=1
+            {signal_filter}
             ORDER BY r.signal_name, s.score DESC
-            """
+            """,
+            parameters,
         )
         return [dict(row) for row in rows]
 
@@ -1220,9 +1329,17 @@ class Database:
             )
             return int(cursor.fetchone()[0])
 
-    def pending_alerts_for_rules(self) -> list[dict[str, Any]]:
+    def pending_alerts_for_rules(self, signal_names: set[str] | None = None) -> list[dict[str, Any]]:
+        signal_filter = ""
+        parameters: tuple[Any, ...] = ()
+        if signal_names:
+            names = sorted({name.strip().lower() for name in signal_names if name.strip()})
+            if names:
+                placeholders = ", ".join("?" for _ in names)
+                signal_filter = f" AND lower(p.signal_name) IN ({placeholders})"
+                parameters = tuple(names)
         rows = self.query(
-            """
+            f"""
             SELECT
                 p.id,
                 p.alert_rule_id,
@@ -1257,8 +1374,10 @@ class Database:
              AND s.symbol=p.symbol
              AND s.is_latest=1
             WHERE p.status='pending'
+            {signal_filter}
             ORDER BY p.updated_at
-            """
+            """,
+            parameters,
         )
         return [dict(row) for row in rows]
 

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Stock Notifier 15-minute scan cycle on weekdays
+
+[Timer]
+# Runs every 15 minutes on weekdays. The app still skips outside market hours
+# when SCAN_MARKET_HOURS_ONLY=true, using ALERT_DEFAULT_TIMEZONE.
+OnCalendar=Mon..Fri *-*-* *:00/15:00
+Persistent=false
+RandomizedDelaySec=30
+Unit=stock-notifier-scan-cycle.service
+
+[Install]
+WantedBy=timers.target

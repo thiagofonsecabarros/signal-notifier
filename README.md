@@ -17,6 +17,8 @@ The current deployment target is a single Oracle Cloud VM running Ubuntu, Stream
 | Configurable Signal Builder | Working |
 | Telegram notification engine | Working |
 | Intraday/full-market scanning | Working as E2-safe filtered scan cycle |
+| Scheduled Services jobs | Working |
+| Latest runs / notification history | Working |
 | Canada/TSX support | Later, requires a second provider |
 
 The project supports daily/end-of-day fetches and a filtered full-market snapshot scan cycle. The snapshot cycle is designed to stay safe on the small Oracle E2.1.Micro VM by filtering the full market before scoring.
@@ -42,9 +44,9 @@ Massive/Polygon API
 On the Oracle VM:
 
 ```text
-Caddy :80/:443 ──► Streamlit 127.0.0.1:8501
-systemd timer    ──► scheduled fetch/scan cycle
-SQLite           ──► SERVER_DB_FILEPATH
+Caddy :80/:443      ──► Streamlit 127.0.0.1:8501
+systemd timers      ──► scheduled fetch / scan cycle / service scheduler
+SQLite              ──► SERVER_DB_FILEPATH
 ```
 
 ## Repository layout
@@ -57,7 +59,11 @@ stock-notifier/
 │   ├── Caddyfile
 │   ├── stock-notifier-dashboard.service
 │   ├── stock-notifier-fetch.service
-│   └── stock-notifier-fetch.timer
+│   ├── stock-notifier-fetch.timer
+│   ├── stock-notifier-scan-cycle.service
+│   ├── stock-notifier-scan-cycle.timer
+│   ├── stock-notifier-services-scheduler.service
+│   └── stock-notifier-services-scheduler.timer
 ├── scripts/
 │   └── bootstrap_server.sh
 ├── src/stock_notifier/
@@ -70,6 +76,7 @@ stock-notifier/
 │   ├── notifications/
 │   ├── providers/
 │   ├── scoring/
+│   ├── services/
 │   └── symbols.py
 ├── tests/
 ├── .env.example
@@ -238,6 +245,8 @@ Telegram notifications:
 stock-notifier telegram-test --dry-run
 stock-notifier telegram-test
 stock-notifier alert-rules-seed
+stock-notifier alert-test --signal "MA Momentum" --symbol AAPL --direction BUY --dry-run
+stock-notifier alert-test --signal "MA Momentum" --symbol AAPL --direction BUY --send
 stock-notifier alerts-scan --dry-run
 stock-notifier alerts-scan
 stock-notifier alerts-scan --send
@@ -248,25 +257,31 @@ Intraday/full-market scan cycle:
 
 ```powershell
 stock-notifier run-scan-cycle --dry-run --benchmark --max-symbols 50
+stock-notifier run-scan-cycle --dry-run --benchmark --max-symbols 50 --symbols AAPL,MSFT,NVDA --force
 stock-notifier run-scan-cycle --benchmark --max-symbols 500
+stock-notifier run-scan-cycle --skip-telegram --benchmark --max-symbols 500
+stock-notifier services-run-due
+stock-notifier services-run-due --service snapshot --force
+stock-notifier services-run-due --signal 1 --force
+stock-notifier services-run-due --test-alert 1
 ```
 
 The scan cycle performs:
 
 ```text
-full-market snapshot → price/volume filters → score enabled signals → scheduled alert scan → Telegram
+full-market snapshot → latest snapshot + 10-hour intraday history → price/volume filters → grouped scoring for enabled signals → scheduled alert scan → Telegram/dry-run
 ```
 
 ## Dashboard
 
 The Streamlit dashboard currently includes:
 
-- **Market data** — Stocks universe/list view selector, searchable symbol/company lookup, range selector, aligned price and volume chart.
+- **Market data** — Stocks universe/list view selector, searchable symbol/company lookup, range selector, cached symbol history, and aligned no-gap price/volume chart.
 - **Lists** — full-width list workspace with existing-list table, create/manage selector, manual ticker management, and signal-derived list creation.
-- **Signal Builder** — configurable technical-signal definitions stored in SQLite, with inline component help, examples, and universe selection by lists/tickers.
-- **Notifications** — Telegram configuration status, missing-rule prompts for newly created signals, editable scheduled alert rules, pending alerts, recent alerts, and delivery history.
-- **Services** — bounded maintenance/data-ingestion actions, including market snapshots, chunked historical-data backfills, and chunked company-profile ingestion for the stock universe, selected lists, or typed tickers.
-- **Latest runs** — fetch logs, signal-run history, service-run history, and scan-cycle history.
+- **Signal Builder** — configurable technical-signal definitions stored in SQLite, with inline component help, examples, universe selection by lists/tickers, per-signal scheduler controls, and a Test alert button that refreshes Massive snapshot data and sends/records a compact top-10 Telegram digest.
+- **Notifications** — Telegram configuration status, pipeline status, full scan-cycle test controls, sample alert sender, missing-rule prompts for newly created signals, editable scheduled alert rules, pending alerts, recent alerts, and delivery history.
+- **Services** — bounded maintenance/data-ingestion actions, including market snapshots, chunked historical-data backfills, and chunked company-profile ingestion for the stock universe, selected lists, or typed tickers. Each service also has a persistent scheduler with minute/hour/day/business-day/week frequencies and optional Telegram completion/error notifications.
+- **Latest runs** — Telegram notification delivery history, fetch logs, signal-run history, service-run history, and scan-cycle history. Timestamps are displayed in US Eastern time with human-readable column names.
 
 The Signal Builder supports weighted score components and hard gate/filter components. Current component types include:
 
@@ -314,6 +329,10 @@ The **Market data** tab lets you choose a single view with checkbox-style select
 - Any custom list you created, such as `Portfolio`, `Potential`, or `Liquid Universe`.
 
 Only one Market Data view is active at a time. The table, symbol search, and chart selector all use the selected view.
+
+When a custom list is selected, Market Data loads only that list's symbols instead of loading the full stock universe first. This keeps list views faster after broad historical backfills.
+
+The Market Data table is optimized for large historical backfills by reading only the latest and previous daily bar per symbol. The symbol chart loads separately after clicking **Load chart** for the selected ticker, so the table/page can render first. The chart uses trading-day spacing instead of calendar-day spacing: weekends and market holidays are removed from the X-axis, so price lines and volume bars remain continuous and aligned. Per-symbol history is cached briefly and invalidated when the SQLite database file changes, making range changes such as `3M` to `1Y` faster after the first chart load for the same symbol.
 
 Signal definitions can then use:
 
@@ -580,6 +599,7 @@ Score: Close vs EMA20, score min 0, score max 8
 - Use `threshold = 0` for moving-average distance/crossover checks when you mean “above.”
 - Use ADX as trend strength, not direction. Combine it with MA or price-position gates for bullish/bearish context.
 - Keep score ranges realistic. If Score max is too high, everything scores low; if too low, everything maxes out at 100.
+- The scoring engine infers the recent history needed by each signal. For example, a 50-day relative-volume signal loads roughly the latest 55 daily bars per symbol, not all available historical data.
 - For the current E2.1.Micro VM, prefer filtered scan cycles such as `--max-symbols 50` to `500` until you confirm runtime is stable.
 
 ## Telegram setup
@@ -635,11 +655,62 @@ Default behavior:
 - Cooldown prevents repeated alerts for the same signal/symbol/direction.
 - Dry-run mode records delivery rows without calling Telegram.
 
-Recommended chain:
+Recommended notification chains:
 
 ```text
-fetch-daily → score-all → alerts-scan → Telegram
+EOD/daily: fetch-daily → score-all → alerts-scan → Telegram
+15-minute: run-scan-cycle → snapshot/history → grouped score update → alerts-scan → Telegram
 ```
+
+Important distinction: `alerts-scan` reads existing saved scores only. It does not fetch new market data or recompute signals. For 15-minute alerts, use `run-scan-cycle`.
+
+### Scheduled signal digests
+
+Saved signals can also have their own scheduler in **Signal Builder**. This scheduler is separate from alert-rule delivery schedules:
+
+- the signal scheduler controls when the signal is processed;
+- alert rules still control threshold crossing behavior;
+- the Telegram checkbox on the signal schedule controls whether a compact digest is sent after the scheduled run.
+
+When a scheduled signal is due, the services scheduler performs:
+
+```text
+Massive full-market snapshot freshness check
+→ fetch snapshot if needed, or reuse recent snapshots
+→ update latest snapshots for that signal universe
+→ append short intraday snapshot history
+→ score the signal using the refreshed snapshot as latest data
+→ evaluate alert rules for that signal only
+→ optionally send a compact Telegram digest
+```
+
+Snapshot reuse is intentionally conservative:
+
+```text
+If at least 95% of the signal universe has market snapshots fetched in the last 14 minutes:
+    reuse existing snapshots
+else:
+    call Massive full-market snapshot once and update the signal universe
+```
+
+This matches the 15-minute delayed Massive/Polygon data model and avoids pulling the same full-market snapshot repeatedly when multiple schedules fire within the same data window.
+
+The digest sends up to 10 top-ranked symbols in a compact table:
+
+```text
+Type      Sym     Score   Price     Pc%    Vol(M)
+Buy       ABC      68.0     $6.23    55.8    18.51
+Watch     XYZ      61.4    $14.80     7.2     4.33
+```
+
+Digest rows are labeled:
+
+- `Buy` — score is at or above the signal's buy threshold.
+- `Sell` — score is at or below the signal's sell threshold.
+- `Watch` — score is between thresholds.
+- `Filtered` — one or more gates failed.
+
+The digest includes a dashboard link plus compact TradingView/Yahoo Finance links for the symbols shown.
 
 ## Oracle server operations
 
@@ -676,6 +747,36 @@ Run the 15-minute delayed snapshot scan manually:
 
 ```bash
 stock-notifier run-scan-cycle --dry-run --benchmark --max-symbols 50
+stock-notifier run-scan-cycle --dry-run --benchmark --max-symbols 50 --symbols AAPL,MSFT,NVDA --force
+```
+
+Use `--force` only for manual testing outside market hours. Production timers should normally respect `SCAN_MARKET_HOURS_ONLY=true`.
+
+Production scan-cycle timer files are provided as `deploy/stock-notifier-scan-cycle.service` and `deploy/stock-notifier-scan-cycle.timer`. Enable the timer only after manual dry-run cycles are fast and correct.
+
+Scheduled service timer files are provided as `deploy/stock-notifier-services-scheduler.service` and `deploy/stock-notifier-services-scheduler.timer`. This timer wakes every 5 minutes and runs `stock-notifier services-run-due`; each service and scheduled signal decides whether it is due based on the schedules saved in SQLite.
+
+Install and enable the services scheduler timer once on the server. After that, changing service or signal schedules in the dashboard does not require copying or re-enabling systemd files; the timer keeps waking up and reads the latest saved schedules from SQLite.
+
+
+Run enabled scheduled services manually:
+
+```bash
+stock-notifier services-run-due
+stock-notifier services-run-due --service snapshot --force
+stock-notifier services-run-due --service historical --force
+stock-notifier services-run-due --service profiles --force
+stock-notifier services-run-due --signal 1 --force
+stock-notifier services-run-due --test-alert 1
+```
+
+`--force` is for testing: it runs the selected service or signal even if its schedule is disabled or not due. Scheduled services use the options already persisted from the Services tab. Scheduled signals use the saved signal definition and scheduler in Signal Builder. Telegram sends or dry-runs according to `ALERT_DRY_RUN`.
+
+Send a realistic sample Telegram alert without changing alert crossing state:
+
+```bash
+stock-notifier alert-test --signal "MA Momentum" --symbol AAPL --direction BUY --dry-run
+stock-notifier alert-test --signal "MA Momentum" --symbol AAPL --direction BUY --send
 ```
 
 Restart dashboard:
@@ -837,15 +938,23 @@ Copy changed source files:
 scp -i $KEY -r "$LOCAL\src\stock_notifier" "${SERVER}:${REMOTE}/src/"
 ```
 
+If this is the first deployment that includes the service scheduler, create the remote package folder before copying individual scheduler files:
+
+```bash
+mkdir -p SERVER_PROJECT_DIR/src/stock_notifier/services
+```
+
 Then on the server:
 
 ```bash
 cd SERVER_PROJECT_DIR
 source .venv/bin/activate
-python -m py_compile src/stock_notifier/*.py src/stock_notifier/scoring/*.py src/stock_notifier/notifications/*.py
+python -m py_compile src/stock_notifier/*.py src/stock_notifier/scoring/*.py src/stock_notifier/notifications/*.py src/stock_notifier/providers/*.py src/stock_notifier/services/*.py
 stock-notifier init-db
 sudo systemctl restart stock-notifier-dashboard.service
 ```
+
+Install updated systemd service/timer files only when the files under `deploy/` changed, or when enabling a timer for the first time. Normal dashboard schedule edits do not need systemd commands.
 
 ## Security notes
 
@@ -866,6 +975,7 @@ Current SQLite schema includes:
 - `company_profiles`
 - `daily_bars`
 - `market_snapshots`
+- `market_snapshot_history`
 - `fetch_log`
 - `signal_definitions`
 - `signal_runs`
@@ -896,7 +1006,7 @@ pytest -q
 Compile check:
 
 ```powershell
-python -m py_compile src\stock_notifier\*.py src\stock_notifier\scoring\*.py src\stock_notifier\notifications\*.py
+python -m py_compile src\stock_notifier\*.py src\stock_notifier\scoring\*.py src\stock_notifier\notifications\*.py src\stock_notifier\services\*.py
 ```
 
 Note: invoking Windows Python from WSL can trigger a WSL socket error. Prefer running tests directly from Windows PowerShell.
@@ -909,9 +1019,10 @@ Note: invoking Windows Python from WSL can trigger a WSL socket error. Prefer ru
 | 2 | Configurable scoring engine and Signal Builder | Complete |
 | 3 | Telegram notifications and alert history | Complete |
 | 4 | Scheduled alert rules and E2-safe scan cycle | Implemented |
-| 5 | Production 15-minute systemd timer and cloud rollout | Next |
-| 6 | Backtesting and signal performance analytics | Later |
-| 7 | Canada/TSX support via second provider | Later |
+| 5 | Production 15-minute pipeline visibility, test alerts, intraday history | Implemented |
+| 6 | Services and signal scheduler, Telegram digests, Latest runs notification history | Implemented |
+| 7 | Backtesting and signal performance analytics | Later |
+| 8 | Canada/TSX support via second provider | Later |
 
 ## Cost model
 
@@ -931,4 +1042,4 @@ Likely future cost:
 
 ---
 
-Last updated: 2026-07-10.
+Last updated: 2026-07-14.

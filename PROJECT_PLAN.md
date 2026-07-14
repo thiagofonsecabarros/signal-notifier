@@ -5,6 +5,30 @@
 - **Canada (TSX/TSXV) is the hard part**: no cheap provider offers real-time full-exchange intraday snapshots. Use EODHD ($19.99–29.99/mo) for delayed/EOD TSX + TSXV bulk data; accept that Canadian scanning is best done on daily bars refreshed a few times per session rather than true 15-minute real-time.
 - **Off-the-shelf platforms (TradingView, Finviz, Trade Ideas) cannot realistically do custom composite scoring across 5,000+ names with push alerts** — TradingView's Ultimate plan caps at 2,000 active alerts (per TradingView support: "Ultimate Plan: 2000 active alerts (1000 price alerts + 1000 technical alerts)"), and Finviz/Trade Ideas are US-only. Use them as a complement, not the core.
 
+## Current implementation status
+
+The Signal Notifier application now has the main US-focused MVP pieces implemented:
+
+- Oracle/Ubuntu deployment with Streamlit behind Caddy.
+- SQLite storage for symbols, lists, company profiles, daily bars, latest snapshots, short intraday snapshot history, signals, scores, alerts, notification deliveries, service runs, app settings, and scan-cycle runs.
+- Configurable Signal Builder with score components, gate/filter components, preview rankings, saved signal definitions, and signal-derived list creation.
+- Market Data view switching between the full stock universe and custom lists; custom list views load only the selected list's symbols.
+- Telegram notification engine with dry-run mode, sample alert testing, scheduled alert rules, pending alerts, delivery history, and full scan-cycle integration.
+- E2-safe 15-minute scan-cycle pipeline:
+
+```text
+Massive full-market snapshot → latest snapshot + short intraday history → price/volume filters → grouped signal scoring → alert evaluation → Telegram/dry-run → run health
+```
+
+- Services tab with persisted options for market snapshot ingestion, historical data backfill, and company profile ingestion.
+- Service scheduler controls per service and per signal: enabled flag, frequency amount/unit, start/end time for minute schedules, weekday filters, and optional Telegram completion/error notices.
+- `stock-notifier services-run-due` CLI plus systemd timer files that wake every 5 minutes and execute whichever saved services or signals are due.
+- Scheduled signal processing uses Massive snapshot freshness caching: reuse recent snapshots within the 15-minute delayed-data window when possible, otherwise fetch the full-market snapshot once and update the signal universe before scoring.
+- Scheduled signal Telegram digests include the top 10 scored symbols with type, score, price, percent change, volume, and compact TradingView/Yahoo/dashboard links.
+- Latest runs dashboard with Telegram notification history, fetch logs, signal runs, service runs, and scan-cycle runs displayed with human-readable column names and US Eastern timestamps.
+
+The remaining work is mostly hardening and scale work: production timer tuning, backtesting/performance analytics, rolling indicator/cache optimizations if benchmarks demand them, and adding a Canadian data provider later.
+
 ## Key Findings
 
 1. **The single most important architectural decision is using a "full-market snapshot" endpoint instead of per-ticker calls.** Polygon.io's `get_snapshot_all` returns the current minute bar, day aggregate, previous-day bar, and last trade/quote for *every* traded US stock in **one HTTP request**. This collapses a 5,000-request problem into a 1-request problem and makes 15-minute scanning trivial. Per-ticker or credit-metered APIs (Alpha Vantage, Finnhub free, Twelve Data) are the wrong tool for 5,000-symbol scanning.
@@ -165,6 +189,21 @@ Finviz Elite ($39.50/mo, or $24.96/mo billed annually) + Trade Ideas ($127–254
 *Phase 3 — Canada (Week 3, +$20):* Add EODHD, daily bulk pull for TSX + TSXV after Toronto close, same scoring pipeline. Intraday-poll only a Canadian watchlist.
 
 *Phase 4 — Dashboard & polish (Week 4):* Streamlit dashboard with alert history + drill-down; SES daily digest email; ntfy backup; a health-check ping so you know the scanner is alive.
+
+**Implemented project phases in this repository:**
+
+1. **Foundation:** local setup, Oracle deployment, SQLite schema, data ingestion, dashboard, Caddy, and basic timers.
+2. **Signal Builder:** configurable SQLite-backed signal definitions with weighted score components and gates.
+3. **Telegram alerts:** Bot API outbound messages, alert rules, dedupe/crossing state, dry-run mode, delivery history, and sample alert testing.
+4. **15-minute scan cycle:** full-market snapshot ingestion, short intraday snapshot history, E2-safe prefilters, grouped scoring, alert evaluation, and scan-cycle health logging.
+5. **Services + signal scheduler:** dashboard-managed market snapshot, historical backfill, and company profile jobs with persisted options, service-run logs, systemd wake timer, per-signal scheduled scoring, snapshot reuse, and optional Telegram completion/error notices or top-10 signal digests.
+
+**Next implementation priorities:**
+
+- Keep the production 15-minute scan cycle benchmarked on the current VM before raising `SCAN_MAX_SYMBOLS`.
+- Add richer service-run cancellation/progress for long dashboard-triggered jobs if needed.
+- Add signal performance analytics/backtesting before relying on scores for portfolio decisions.
+- Add Canadian provider support only after the US workflow is stable.
 
 **Benchmarks that would change the plan:**
 - If you need **true real-time US** (intraday day-trading rather than swing signals) → upgrade Massive to Advanced ($199); Developer is still 15-minute delayed under the current lineup.

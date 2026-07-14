@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from stock_notifier.config import Settings
 from stock_notifier.db import Database
 from stock_notifier.models import Symbol
-from stock_notifier.notifications.service import scan_alerts, seed_alert_rules, send_telegram_test
+from stock_notifier.notifications.service import scan_alerts, seed_alert_rules, send_sample_alert, send_telegram_test
 
 
 def _settings(tmp_path: Path, *, dry_run: bool = True) -> Settings:
@@ -107,3 +107,28 @@ def test_telegram_test_respects_dry_run(tmp_path):
     assert sent is False
     deliveries = database.recent_notification_deliveries()
     assert deliveries[0]["status"] == "dry_run"
+
+
+def test_sample_alert_dry_run_uses_latest_score_without_creating_alert(tmp_path):
+    settings = _settings(tmp_path, dry_run=True)
+    database = Database(settings.db_path)
+    database.initialize()
+    database.sync_symbols([Symbol("AAPL", "Apple")])
+    database.upsert_signal_definition("MA Momentum", {"components": []})
+    seed_alert_rules(database, settings)
+    _store_score(database, score=82)
+
+    sent = send_sample_alert(
+        database,
+        settings,
+        signal_name="MA Momentum",
+        symbol="AAPL",
+        direction="BUY",
+        dry_run=True,
+    )
+
+    assert sent is False
+    assert database.recent_alerts() == []
+    delivery = database.recent_notification_deliveries()[0]
+    assert delivery["status"] == "dry_run"
+    assert delivery["alert_id"] is None

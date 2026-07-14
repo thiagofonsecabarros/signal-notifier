@@ -1,0 +1,13 @@
+[Unit]
+Description=Check Stock Notifier scheduled services every 5 minutes
+
+[Timer]
+# Wakes the scheduler frequently; each service decides whether it is due
+# based on the schedule persisted from the Services tab.
+OnCalendar=*:0/5
+Persistent=false
+RandomizedDelaySec=20
+Unit=stock-notifier-services-scheduler.service
+
+[Install]
+WantedBy=timers.target

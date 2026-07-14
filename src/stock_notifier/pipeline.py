@@ -13,7 +13,7 @@ from stock_notifier.db import Database
 from stock_notifier.notifications.schedule import AlertSchedule, is_market_hours
 from stock_notifier.notifications.service import AlertScanResult, scan_alerts
 from stock_notifier.providers.base import MarketDataProvider
-from stock_notifier.scoring.service import score_enabled_signals
+from stock_notifier.scoring.service import score_enabled_signals_grouped
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,8 @@ class ScanCycleResult:
     alerts: AlertScanResult
     duration_seconds: float
     dry_run: bool
+    snapshot_history_rows: int = 0
+    snapshot_history_pruned: int = 0
     message: str = ""
 
 
@@ -56,6 +58,7 @@ def run_scan_cycle(
     symbols: Iterable[str] | None = None,
     skip_telegram: bool = False,
     benchmark: bool = False,
+    force: bool = False,
 ) -> ScanCycleResult:
     started = time.monotonic()
     run_id = database.start_scan_cycle_run()
@@ -66,11 +69,13 @@ def run_scan_cycle(
     snapshots_fetched = 0
     symbols_filtered = 0
     symbols_scored = 0
+    snapshot_history_rows = 0
+    snapshot_history_pruned = 0
     alert_result = AlertScanResult(0, 0, 0, 0, effective_dry_run)
     message = ""
 
     try:
-        if settings.scan_market_hours_only and not is_market_hours(
+        if (not force) and settings.scan_market_hours_only and not is_market_hours(
             datetime.now(UTC),
             AlertSchedule(
                 timezone=settings.alert_default_timezone,
@@ -85,7 +90,7 @@ def run_scan_cycle(
                 duration_seconds=duration,
                 message=message,
             )
-            return ScanCycleResult(0, 0, 0, alert_result, duration, effective_dry_run, message)
+            return ScanCycleResult(0, 0, 0, alert_result, duration, effective_dry_run, 0, 0, message)
 
         snapshots = provider.full_market_snapshot()
         database.ensure_symbols(snapshot.symbol for snapshot in snapshots)
@@ -100,9 +105,14 @@ def run_scan_cycle(
         )
         symbols_filtered = len(candidate_symbols)
 
-        score_results = score_enabled_signals(
+        candidate_set = set(candidate_symbols)
+        candidate_snapshots = [snapshot for snapshot in snapshots if snapshot.symbol in candidate_set]
+        snapshot_history_rows = database.append_market_snapshot_history(candidate_snapshots)
+        snapshot_history_pruned = database.prune_market_snapshot_history(keep_hours=10)
+
+        score_results = score_enabled_signals_grouped(
             database,
-            symbols=set(candidate_symbols),
+            symbols=candidate_set,
             include_latest_snapshot=True,
         )
         symbols_scored = sum(len(items) for items in score_results.values())
@@ -111,7 +121,7 @@ def run_scan_cycle(
         if benchmark:
             message = (
                 f"bench snapshots={snapshots_fetched} filtered={symbols_filtered} "
-                f"scored={symbols_scored} duration={duration:.2f}s"
+                f"scored={symbols_scored} history_rows={snapshot_history_rows} duration={duration:.2f}s"
             )
         if duration > 720:
             message = (message + "; " if message else "") + "WARNING: scan exceeded 12 minutes"
@@ -134,6 +144,8 @@ def run_scan_cycle(
             alerts=alert_result,
             duration_seconds=duration,
             dry_run=effective_dry_run,
+            snapshot_history_rows=snapshot_history_rows,
+            snapshot_history_pruned=snapshot_history_pruned,
             message=message,
         )
     except Exception as exc:

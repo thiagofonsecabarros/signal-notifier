@@ -1,7 +1,7 @@
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 from stock_notifier.db import Database
-from stock_notifier.models import CompanyProfile, DailyBar, Symbol
+from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot, Symbol
 
 
 def test_database_upserts_are_idempotent(tmp_path):
@@ -111,3 +111,25 @@ def test_symbol_lists_store_members(tmp_path):
     assert lists[0]["name"] == "Core Portfolio"
     assert lists[0]["description"] == "Long-term holdings"
     assert database.symbols_for_list_names(["Core Portfolio"]) == {"AAPL"}
+
+
+def test_market_snapshot_history_insert_and_prune(tmp_path):
+    database = Database(tmp_path / "notifier.db")
+    database.initialize()
+    database.sync_symbols([Symbol("AAPL", "Apple"), Symbol("MSFT", "Microsoft")])
+    old_time = datetime.now(UTC) - timedelta(hours=12)
+    new_time = datetime.now(UTC)
+
+    inserted = database.append_market_snapshot_history([
+        MarketSnapshot("AAPL", old_time, 100.0, day_volume=1_000, percent_change=1.2),
+        MarketSnapshot("MSFT", new_time, 200.0, day_volume=2_000, percent_change=2.3),
+    ])
+    pruned = database.prune_market_snapshot_history(keep_hours=10)
+    status = database.market_snapshot_history_status()
+
+    assert inserted == 2
+    assert pruned == 1
+    assert status["count"] == 1
+    rows = database.query("SELECT symbol, dollar_volume FROM market_snapshot_history")
+    assert rows[0]["symbol"] == "MSFT"
+    assert rows[0]["dollar_volume"] == 400_000

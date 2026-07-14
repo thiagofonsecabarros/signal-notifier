@@ -10,11 +10,13 @@ from stock_notifier.ingest import backfill_symbols, fetch_grouped_with_lookback
 from stock_notifier.notifications.service import (
     scan_alerts,
     seed_alert_rules,
+    send_sample_alert,
     send_telegram_test,
 )
 from stock_notifier.pipeline import run_scan_cycle, scan_cycle_lock
 from stock_notifier.providers.massive import MassiveClient
 from stock_notifier.scoring.service import score_enabled_signals, score_signal, seed_starter_signals
+from stock_notifier.services.scheduler import SERVICE_KEYS, run_due_services, run_due_signals, run_signal_test_alert
 from stock_notifier.symbols import load_symbols
 
 
@@ -55,6 +57,13 @@ def _parser() -> argparse.ArgumentParser:
     telegram_test = subparsers.add_parser("telegram-test", help="Send a Telegram test message")
     telegram_test.add_argument("--dry-run", action="store_true", help="Record the test without sending")
 
+    alert_test = subparsers.add_parser("alert-test", help="Send a sample alert using latest saved score/components")
+    alert_test.add_argument("--signal", required=True, help="Signal name")
+    alert_test.add_argument("--symbol", required=True, help="Ticker symbol")
+    alert_test.add_argument("--direction", choices=["BUY", "SELL"], default="BUY")
+    alert_test.add_argument("--dry-run", action="store_true", help="Record the sample without sending")
+    alert_test.add_argument("--send", action="store_true", help="Force real sending even if ALERT_DRY_RUN=true")
+
     subparsers.add_parser("alert-rules-seed", help="Create default alert rules for enabled signals")
 
     alerts_scan = subparsers.add_parser("alerts-scan", help="Scan latest signal scores for alerts")
@@ -70,6 +79,13 @@ def _parser() -> argparse.ArgumentParser:
     scan_cycle.add_argument("--symbols", help="Optional comma-separated subset")
     scan_cycle.add_argument("--skip-telegram", action="store_true", help="Do not send Telegram messages")
     scan_cycle.add_argument("--benchmark", action="store_true", help="Print timing and volume details")
+    scan_cycle.add_argument("--force", action="store_true", help="Run even outside configured market hours")
+
+    services_due = subparsers.add_parser("services-run-due", help="Run enabled scheduled services/signals that are due")
+    services_due.add_argument("--service", choices=SERVICE_KEYS, action="append", help="Limit to one service; can be repeated")
+    services_due.add_argument("--signal", type=int, action="append", help="Limit to one signal id; can be repeated")
+    services_due.add_argument("--force", action="store_true", help="Run selected services even if not due or disabled")
+    services_due.add_argument("--test-alert", type=int, help="Score one signal id and send a sample Telegram alert for its top symbol")
     return parser
 
 
@@ -93,7 +109,7 @@ def _profile_provider(settings: Settings, requests_per_minute: int | None = None
 
 def main() -> None:
     args = _parser().parse_args()
-    require_api_key = args.command in {"fetch-daily", "backfill", "run-scan-cycle", "sync-profiles"}
+    require_api_key = args.command in {"fetch-daily", "backfill", "run-scan-cycle", "sync-profiles", "services-run-due"}
     settings = Settings.from_env(require_api_key=require_api_key)
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
@@ -197,6 +213,23 @@ def main() -> None:
             print("Telegram test delivered" if sent else "Telegram test failed; check delivery history")
             if not sent:
                 raise SystemExit(2)
+    elif args.command == "alert-test":
+        dry_run = True if args.dry_run else False if args.send else None
+        sent = send_sample_alert(
+            database,
+            settings,
+            signal_name=args.signal,
+            symbol=args.symbol,
+            direction=args.direction,
+            dry_run=dry_run,
+        )
+        effective_dry_run = settings.alert_dry_run if dry_run is None else dry_run
+        if effective_dry_run:
+            print("Recorded sample alert in dry-run mode")
+        else:
+            print("Sample alert delivered" if sent else "Sample alert failed; check delivery history")
+            if not sent:
+                raise SystemExit(2)
     elif args.command == "alert-rules-seed":
         count = seed_alert_rules(database, settings)
         print(f"Seeded/updated {count} alert rules")
@@ -218,6 +251,35 @@ def main() -> None:
                 f"{alert['id']}: {alert['created_at']} {alert['direction']} "
                 f"{alert['symbol']} {alert['signal_name']} score={alert['score']:.2f}"
             )
+    elif args.command == "services-run-due":
+        if args.test_alert is not None:
+            result = run_signal_test_alert(database, settings, int(args.test_alert))
+            print(f"signal:{result.signal_id}: ran status={result.status} message={result.message}")
+            if result.status in {"failed", "partial"}:
+                raise SystemExit(2)
+            return
+        if args.force and not (args.service or args.signal):
+            raise SystemExit("--force requires at least one --service or --signal to avoid accidentally running everything")
+        results = [] if args.signal and not args.service else run_due_services(
+            database,
+            settings,
+            service_keys=args.service,
+            force=args.force,
+        )
+        signal_results = [] if args.service and not args.signal else run_due_signals(
+            database,
+            settings,
+            signal_ids=args.signal,
+            force=args.force,
+        )
+        for result in results:
+            state = "ran" if result.ran else "skipped"
+            print(f"{result.service_key}: {state} status={result.status} message={result.message}")
+        for result in signal_results:
+            state = "ran" if result.ran else "skipped"
+            print(f"signal:{result.signal_id}: {state} status={result.status} message={result.message}")
+        if any(result.status in {"failed", "partial"} for result in [*results, *signal_results] if result.ran):
+            raise SystemExit(2)
     elif args.command == "run-scan-cycle":
         requested_symbols = None
         if args.symbols:
@@ -235,6 +297,7 @@ def main() -> None:
                     symbols=requested_symbols,
                     skip_telegram=args.skip_telegram,
                     benchmark=args.benchmark,
+                    force=args.force,
                 )
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from exc
@@ -244,6 +307,7 @@ def main() -> None:
             f"scored={result.symbols_scored}, alerts={result.alerts.alerts_created}, "
             f"queued={result.alerts.queued}, deliveries={result.alerts.deliveries_attempted}, "
             f"delivered={result.alerts.delivered}, dry_run={result.dry_run}, "
+            f"history_rows={result.snapshot_history_rows}, pruned={result.snapshot_history_pruned}, "
             f"duration={result.duration_seconds:.2f}s"
         )
         if result.message:
