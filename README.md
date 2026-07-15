@@ -279,9 +279,8 @@ The Streamlit dashboard currently includes:
 - **Market data** — Stocks universe/list view selector, searchable symbol/company lookup, range selector, cached symbol history, and aligned no-gap price/volume chart.
 - **Lists** — full-width list workspace with existing-list table, create/manage selector, manual ticker management, and signal-derived list creation.
 - **Signal Builder** — configurable technical-signal definitions stored in SQLite, with inline component help, examples, universe selection by lists/tickers, per-signal scheduler controls, and a Test alert button that refreshes Massive snapshot data and sends/records a compact top-10 Telegram digest.
-- **Notifications** — Telegram configuration status, pipeline status, full scan-cycle test controls, sample alert sender, missing-rule prompts for newly created signals, editable scheduled alert rules, pending alerts, recent alerts, and delivery history.
 - **Services** — bounded maintenance/data-ingestion actions, including market snapshots, chunked historical-data backfills, and chunked company-profile ingestion for the stock universe, selected lists, or typed tickers. Each service also has a persistent scheduler with minute/hour/day/business-day/week frequencies and optional Telegram completion/error notifications.
-- **Latest runs** — Telegram notification delivery history, fetch logs, signal-run history, service-run history, and scan-cycle history. Timestamps are displayed in US Eastern time with human-readable column names.
+- **Latest runs** — Telegram notification delivery history, generated alerts, pending alerts, fetch logs, signal-run history, service-run history, and scan-cycle history. Timestamps are displayed in US Eastern time with human-readable column names.
 
 The Signal Builder supports weighted score components and hard gate/filter components. Current component types include:
 
@@ -694,6 +693,13 @@ else:
 ```
 
 This matches the 15-minute delayed Massive/Polygon data model and avoids pulling the same full-market snapshot repeatedly when multiple schedules fire within the same data window.
+
+The previous standalone Notifications dashboard page has been retired. Telegram setup, service completion/error messages, scheduled signal digests, and test alerts now live where they are used:
+
+- signal notifications and test alerts are configured in **Signal Builder**;
+- service completion/error notifications are configured in **Services**;
+- notification, alert, and delivery history is reviewed in **Latest runs**;
+- advanced/manual alert commands remain available through the CLI.
 
 The digest sends up to 10 top-ranked symbols in a compact table:
 

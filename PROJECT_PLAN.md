@@ -13,7 +13,7 @@ The Signal Notifier application now has the main US-focused MVP pieces implement
 - SQLite storage for symbols, lists, company profiles, daily bars, latest snapshots, short intraday snapshot history, signals, scores, alerts, notification deliveries, service runs, app settings, and scan-cycle runs.
 - Configurable Signal Builder with score components, gate/filter components, preview rankings, saved signal definitions, and signal-derived list creation.
 - Market Data view switching between the full stock universe and custom lists; custom list views load only the selected list's symbols.
-- Telegram notification engine with dry-run mode, sample alert testing, scheduled alert rules, pending alerts, delivery history, and full scan-cycle integration.
+- Telegram notification engine with dry-run mode, Signal Builder test alerts, scheduled signal/service delivery, pending alerts, delivery history, and full scan-cycle integration.
 - E2-safe 15-minute scan-cycle pipeline:
 
 ```text
@@ -26,6 +26,7 @@ Massive full-market snapshot → latest snapshot + short intraday history → pr
 - Scheduled signal processing uses Massive snapshot freshness caching: reuse recent snapshots within the 15-minute delayed-data window when possible, otherwise fetch the full-market snapshot once and update the signal universe before scoring.
 - Scheduled signal Telegram digests include the top 10 scored symbols with type, score, price, percent change, volume, and compact TradingView/Yahoo/dashboard links.
 - Latest runs dashboard with Telegram notification history, fetch logs, signal runs, service runs, and scan-cycle runs displayed with human-readable column names and US Eastern timestamps.
+- The old standalone Notifications dashboard page has been retired. Notification setup now lives in Signal Builder and Services; notification history lives in Latest runs.
 
 The remaining work is mostly hardening and scale work: production timer tuning, backtesting/performance analytics, rolling indicator/cache optimizations if benchmarks demand them, and adding a Canadian data provider later.
 
@@ -194,7 +195,7 @@ Finviz Elite ($39.50/mo, or $24.96/mo billed annually) + Trade Ideas ($127–254
 
 1. **Foundation:** local setup, Oracle deployment, SQLite schema, data ingestion, dashboard, Caddy, and basic timers.
 2. **Signal Builder:** configurable SQLite-backed signal definitions with weighted score components and gates.
-3. **Telegram alerts:** Bot API outbound messages, alert rules, dedupe/crossing state, dry-run mode, delivery history, and sample alert testing.
+3. **Telegram alerts:** Bot API outbound messages, alert rules, dedupe/crossing state, dry-run mode, delivery history, Signal Builder test alerts, and scheduled signal/service digests.
 4. **15-minute scan cycle:** full-market snapshot ingestion, short intraday snapshot history, E2-safe prefilters, grouped scoring, alert evaluation, and scan-cycle health logging.
 5. **Services + signal scheduler:** dashboard-managed market snapshot, historical backfill, and company profile jobs with persisted options, service-run logs, systemd wake timer, per-signal scheduled scoring, snapshot reuse, and optional Telegram completion/error notices or top-10 signal digests.
 

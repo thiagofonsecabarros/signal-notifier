@@ -123,6 +123,8 @@ does not require another `sudo cp`, `daemon-reload`, or `enable --now`.
 
 Scheduled signal runs are designed for 15-minute delayed Massive data. Before scoring, they check whether at least 95% of the signal universe has snapshots fetched in the last 14 minutes. If yes, they reuse the existing snapshot data; otherwise they call Massive's full-market snapshot endpoint once and update only the signal universe. Telegram digests show the top 10 signal results with score, price, percent change, volume, and TradingView/Yahoo links.
 
+The standalone Notifications dashboard page is retired. Configure signal notifications in Signal Builder, service completion/error notifications in Services, and review alert/delivery history in Latest runs.
+
 For HTTPS, point a DNS A record at the reserved IP, replace `:80` in the Caddyfile with the hostname,
 and reload with `sudo systemctl reload caddy`. Caddy obtains the certificate automatically.
 
@@ -168,7 +170,8 @@ sudo -u stocknotifier sqlite3 /opt/stock-notifier/data/stock_notifier.db \
 2. **Phase 2 — scoring:** configurable Signal Builder, indicator components, score/gate modes,
    persisted signal definitions, scores, and component breakdowns.
 3. **Phase 3 — notifications:** Telegram bot/chat, dry-run mode, alert rules, dedupe/crossing
-   state, pending alerts, delivery attempts, alert history, and sample alert testing.
+   state, pending alerts, delivery attempts, alert history, Signal Builder test alerts, and
+   Latest runs delivery history.
 4. **Phase 4 — delayed intraday:** Massive full-market snapshots, short intraday snapshot history,
    VM-safe filtering, grouped scoring, scan-cycle runs, and 15-minute timer support.
 5. **Phase 5 — schedulers:** dashboard-managed market snapshot, historical backfill, and company

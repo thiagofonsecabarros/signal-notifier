@@ -2965,7 +2965,7 @@ def _set_main_navigation(page: str) -> None:
     st.session_state.main_navigation = page
 
 
-page_options = ["Market data", "Lists", "Signal Builder", "Notifications", "Services", "Latest runs"]
+page_options = ["Market data", "Lists", "Signal Builder", "Services", "Latest runs"]
 if st.session_state.get("main_navigation") not in page_options:
     st.session_state.main_navigation = "Market data"
 
@@ -3151,9 +3151,6 @@ if selected_page == "Lists":
 
 if selected_page == "Signal Builder":
     _render_signal_builder()
-
-if selected_page == "Notifications":
-    _render_notifications()
 
 if selected_page == "Services":
     _render_services()
