@@ -207,6 +207,43 @@ def _display_market_data_frame(frame: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _percent_color(value: object) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if numeric > 0:
+        return "color: #16a34a; font-weight: 600"
+    if numeric < 0:
+        return "color: #dc2626; font-weight: 600"
+    return ""
+
+
+def _styled_change_frame(frame: pd.DataFrame) -> object:
+    if frame.empty:
+        return frame
+    change_columns = [
+        column
+        for column in ["Daily change %", "Change %", "daily_change_pct", "change_pct"]
+        if column in frame.columns
+    ]
+    if not change_columns:
+        return frame
+    return frame.style.format({column: "{:.2f}%" for column in change_columns}, na_rep="").applymap(
+        _percent_color,
+        subset=change_columns,
+    )
+
+
+def _colored_percent_html(value: object) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    color = "#16a34a" if numeric > 0 else "#dc2626" if numeric < 0 else "inherit"
+    return f"<span style='color:{color}; font-weight:700'>{numeric:+.2f}%</span>"
+
+
 st.title("Stock Signal Notifier")
 st.caption("Configurable signal scoring · full-market snapshots · scheduled Telegram alerts")
 
@@ -884,7 +921,11 @@ def _render_stock_detail(symbol: str) -> None:
     dollar_volume = (float(price or 0) * float(day_volume or 0)) if price is not None and day_volume is not None else None
     metric_cols = st.columns(5)
     metric_cols[0].metric("Price", f"${float(price):,.2f}" if price is not None else "—")
-    metric_cols[1].metric("Change", f"{float(percent_change):+.2f}%" if percent_change is not None else "—")
+    metric_cols[1].markdown(
+        "<div style='font-size:0.875rem; color:rgba(49,51,63,0.7); margin-bottom:0.15rem'>Change</div>"
+        f"<div style='font-size:1.75rem; line-height:1.2'>{_colored_percent_html(percent_change)}</div>",
+        unsafe_allow_html=True,
+    )
     metric_cols[2].metric("Previous close", f"${float(previous_close):,.2f}" if previous_close is not None else "—")
     metric_cols[3].metric("Volume", f"{float(day_volume):,.0f}" if day_volume is not None else "—")
     metric_cols[4].metric("Dollar volume", f"${float(dollar_volume):,.0f}" if dollar_volume is not None else "—")
@@ -908,6 +949,24 @@ def _render_stock_detail(symbol: str) -> None:
             homepage = str(summary.get("homepage_url") or "").strip()
             if homepage:
                 st.markdown(f"[Company website]({homepage})")
+
+    st.markdown("#### Symbol chart")
+    st.caption("Chart history loads automatically for the opened stock detail and is cached per symbol.")
+    range_options = ["Intraday", "5D", "1W", "1M", "3M", "6M", "1Y", "3Y"]
+    selected_range = st.radio(
+        "Range",
+        range_options,
+        horizontal=True,
+        index=3,
+        label_visibility="collapsed",
+        key=f"detail_chart_range_{symbol}",
+    )
+    with st.spinner(f"Loading chart history for {symbol}..."):
+        history = _symbol_history(symbol, _db_cache_key())
+        visible_history = _history_for_range(history, selected_range)
+    if selected_range == "Intraday":
+        st.info("Intraday data is not enabled yet, so this shows the latest available daily bar for now.")
+    _render_price_volume_chart(visible_history, symbol)
 
     list_frame = _stock_detail_lists(symbol)
     score_frame = _stock_detail_scores(symbol)
@@ -1362,6 +1421,32 @@ def _select_market_view() -> dict[str, object]:
             st.rerun()
 
     return options[labels.index(selected_label)]
+
+
+def _render_stock_lookup() -> None:
+    st.markdown("#### Stock lookup")
+    lookup_cols = st.columns([2, 1])
+    detail_query = lookup_cols[0].text_input(
+        "Search any symbol or company",
+        placeholder="Type a ticker or company name, e.g. NVDA or Nvidia",
+        key="market_detail_search",
+        help="Searches the full active Stocks universe, not only the currently selected table/list view.",
+    )
+    detail_matches = _global_symbol_matches(detail_query, limit=8) if detail_query.strip() else pd.DataFrame()
+    if detail_query.strip() and detail_matches.empty:
+        lookup_cols[1].warning("No matching active symbols.")
+    elif not detail_matches.empty:
+        lookup_cols[1].caption("Open closest matches")
+        match_columns = st.columns(4)
+        for index, row in detail_matches.reset_index(drop=True).iterrows():
+            ticker = str(row["ticker"])
+            name = str(row.get("name") or "").strip()
+            label = ticker if not name else f"{ticker} · {name[:28]}"
+            with match_columns[index % len(match_columns)]:
+                if st.button(label, key=f"detail_match_{ticker}", use_container_width=True):
+                    st.session_state.market_detail_symbol = ticker
+                    st.session_state.market_selected_symbol = ticker
+                    st.rerun()
 
 
 COMPONENT_LABELS = {
@@ -2805,8 +2890,9 @@ def _render_services() -> None:
                 )
                 if selected_snapshots:
                     st.markdown("#### Stored snapshot preview")
+                    snapshot_preview = _snapshot_rows(selected_snapshots, limit=50)
                     st.dataframe(
-                        _snapshot_rows(selected_snapshots, limit=50),
+                        _styled_change_frame(snapshot_preview),
                         use_container_width=True,
                         hide_index=True,
                         column_config={
@@ -3360,6 +3446,7 @@ for index, option in enumerate(page_options):
 selected_page = st.session_state.main_navigation
 
 if selected_page == "Market data":
+    _render_stock_lookup()
     selected_view = _select_market_view()
     view_title = "Stocks universe"
     view_caption = "General list of active symbols."
@@ -3390,30 +3477,6 @@ if selected_page == "Market data":
 
         st.subheader(view_title)
         st.caption(view_caption)
-        st.markdown("#### Stock lookup")
-        lookup_cols = st.columns([2, 1])
-        detail_query = lookup_cols[0].text_input(
-            "Search any symbol or company",
-            placeholder="Type a ticker or company name, e.g. NVDA or Nvidia",
-            key="market_detail_search",
-            help="Searches the full active Stocks universe, not only the currently selected table/list view.",
-        )
-        detail_matches = _global_symbol_matches(detail_query, limit=8) if detail_query.strip() else pd.DataFrame()
-        if detail_query.strip() and detail_matches.empty:
-            lookup_cols[1].warning("No matching active symbols.")
-        elif not detail_matches.empty:
-            lookup_cols[1].caption("Open closest matches")
-            match_columns = st.columns(4)
-            for index, row in detail_matches.reset_index(drop=True).iterrows():
-                ticker = str(row["ticker"])
-                name = str(row.get("name") or "").strip()
-                label = ticker if not name else f"{ticker} · {name[:28]}"
-                with match_columns[index % len(match_columns)]:
-                    if st.button(label, key=f"detail_match_{ticker}", use_container_width=True):
-                        st.session_state.market_detail_symbol = ticker
-                        st.session_state.market_selected_symbol = ticker
-                        st.session_state.market_chart_loaded_symbol = None
-                        st.rerun()
 
         detail_symbol = str(st.session_state.get("market_detail_symbol") or "").upper().strip()
         if detail_symbol:
@@ -3442,7 +3505,7 @@ if selected_page == "Market data":
             }
             try:
                 table_event = st.dataframe(
-                    market_display,
+                    _styled_change_frame(market_display),
                     on_select="rerun",
                     selection_mode="single-row",
                     key="market_data_table",
@@ -3461,81 +3524,11 @@ if selected_page == "Market data":
                     if selected_ticker and selected_ticker != st.session_state.get("market_detail_symbol"):
                         st.session_state.market_detail_symbol = selected_ticker
                         st.session_state.market_selected_symbol = selected_ticker
-                        st.session_state.market_chart_loaded_symbol = None
                         st.rerun()
             except TypeError:
-                st.dataframe(market_display, **dataframe_kwargs)
+                st.dataframe(_styled_change_frame(market_display), **dataframe_kwargs)
 
-        if available:
-            st.subheader("Symbol chart")
-            query = st.text_input(
-                "Search symbol or company in selected view",
-                placeholder="Type a ticker or company name, e.g. NVDA or Nvidia",
-            )
-            matches = _symbol_matches(visible_latest, query)
-            if query.strip() and matches.empty:
-                st.warning("No matching symbols found in the selected view.")
-            elif not matches.empty:
-                st.caption("Closest matches")
-                match_columns = st.columns(4)
-                for index, row in matches.reset_index(drop=True).iterrows():
-                    ticker = str(row["ticker"])
-                    name = str(row["name"] or "").strip()
-                    label = ticker if not name else f"{ticker} · {name[:28]}"
-                    with match_columns[index % len(match_columns)]:
-                        if st.button(label, key=f"symbol_match_{ticker}", use_container_width=True):
-                            st.session_state.market_selected_symbol = ticker
-                            st.session_state.market_detail_symbol = ticker
-                            st.session_state.market_chart_loaded_symbol = None
-                            st.rerun()
-
-            selected = st.session_state.market_selected_symbol
-            selected_row = visible_latest.loc[visible_latest["ticker"] == selected].head(1)
-            if not selected_row.empty:
-                company_name = str(selected_row.iloc[0].get("name") or "").strip()
-                close = selected_row.iloc[0].get("close")
-                change = selected_row.iloc[0].get("daily_change_pct")
-                st.markdown(
-                    f"#### {selected}"
-                    + (f" · {company_name}" if company_name else "")
-                    + (f" · ${close:,.2f}" if pd.notna(close) else "")
-                    + (f" · {change:+.2f}%" if pd.notna(change) else "")
-                )
-
-            chart_loaded = st.session_state.get("market_chart_loaded_symbol") == selected
-            chart_columns = st.columns([1, 3])
-            with chart_columns[0]:
-                if st.button(f"Load chart for {selected}", type="primary", use_container_width=True):
-                    st.session_state.market_chart_loaded_symbol = selected
-                    chart_loaded = True
-            with chart_columns[1]:
-                st.caption(
-                    "The market table loads first. Charts are loaded separately and cached per symbol, "
-                    "so range changes are faster after the first chart load."
-                )
-
-            if chart_loaded:
-                range_options = ["Intraday", "5D", "1W", "1M", "3M", "6M", "1Y", "3Y"]
-                selected_range = st.radio(
-                    "Range",
-                    range_options,
-                    horizontal=True,
-                    index=3,
-                    label_visibility="collapsed",
-                )
-                with st.spinner(f"Loading chart history for {selected}..."):
-                    history = _symbol_history(str(selected), _db_cache_key())
-                    visible_history = _history_for_range(history, selected_range)
-                if selected_range == "Intraday":
-                    st.info("Intraday data is not enabled yet, so this shows the latest available daily bar for now.")
-                _render_price_volume_chart(visible_history, selected)
-                st.markdown(
-                    f"[TradingView](https://www.tradingview.com/chart/?symbol={selected}) · "
-                    f"[Yahoo Finance](https://finance.yahoo.com/quote/{selected})"
-                )
-            else:
-                st.info("Chart not loaded yet. Click the button above to load history for the selected symbol.")
-        elif not visible_latest.empty:
+        if not available and not visible_latest.empty:
             st.info("No chartable symbols found in the selected view.")
 
 if selected_page == "Lists":

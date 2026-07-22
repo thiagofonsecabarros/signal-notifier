@@ -332,13 +332,13 @@ The **Market data** tab lets you choose a single view with checkbox-style select
 - **Stocks universe** — the full active stock universe currently in the database.
 - Any custom list you created, such as `Portfolio`, `Potential`, or `Liquid Universe`.
 
-Only one Market Data view is active at a time. The table and chart selector use the selected view.
+Only one Market Data view is active at a time. The table uses the selected view. The stock lookup at the top searches the full active universe so you can open any ticker without switching views.
 
-Market Data also includes an on-demand stock detail panel. Use the top **Stock lookup** search to open any active ticker in the database, or select/click a ticker row in the table when supported by your Streamlit version. The detail panel is local-first and shows latest snapshot metrics, profile metadata, list memberships, latest signal scores, component breakdowns, recent alerts, and TradingView/Yahoo links. The optional **Refresh profile** button makes one Massive ticker-overview call for that symbol; it does not fetch the full market on every click.
+Market Data also includes an on-demand stock detail panel. Use the **Stock lookup** search directly under the main navigation to open any active ticker in the database, or select/click a ticker row in the table when supported by your Streamlit version. The detail panel is local-first and shows latest snapshot metrics, profile metadata, list memberships, latest signal scores, component breakdowns, recent alerts, TradingView/Yahoo links, and the symbol chart. The optional **Refresh profile** button makes one Massive ticker-overview call for that symbol; it does not fetch the full market on every click.
 
 When a custom list is selected, Market Data loads only that list's symbols instead of loading the full stock universe first. This keeps list views faster after broad historical backfills.
 
-The Market Data table is optimized for large historical backfills by reading only the latest and previous daily bar per symbol. The symbol chart loads separately after clicking **Load chart** for the selected ticker, so the table/page can render first. The chart uses trading-day spacing instead of calendar-day spacing: weekends and market holidays are removed from the X-axis, so price lines and volume bars remain continuous and aligned. Per-symbol history is cached briefly and invalidated when the SQLite database file changes, making range changes such as `3M` to `1Y` faster after the first chart load for the same symbol.
+The Market Data table is optimized for large historical backfills by reading only the latest and previous daily bar per symbol. The symbol chart is shown inside the stock detail panel and loads automatically when details are opened. The chart uses trading-day spacing instead of calendar-day spacing: weekends and market holidays are removed from the X-axis, so price lines and volume bars remain continuous and aligned. Per-symbol history is cached briefly and invalidated when the SQLite database file changes, making range changes such as `3M` to `1Y` faster after the first load for the same symbol.
 
 Signal definitions can then use:
 
