@@ -332,7 +332,9 @@ The **Market data** tab lets you choose a single view with checkbox-style select
 - **Stocks universe** — the full active stock universe currently in the database.
 - Any custom list you created, such as `Portfolio`, `Potential`, or `Liquid Universe`.
 
-Only one Market Data view is active at a time. The table, symbol search, and chart selector all use the selected view.
+Only one Market Data view is active at a time. The table and chart selector use the selected view.
+
+Market Data also includes an on-demand stock detail panel. Use the top **Stock lookup** search to open any active ticker in the database, or select/click a ticker row in the table when supported by your Streamlit version. The detail panel is local-first and shows latest snapshot metrics, profile metadata, list memberships, latest signal scores, component breakdowns, recent alerts, and TradingView/Yahoo links. The optional **Refresh profile** button makes one Massive ticker-overview call for that symbol; it does not fetch the full market on every click.
 
 When a custom list is selected, Market Data loads only that list's symbols instead of loading the full stock universe first. This keeps list views faster after broad historical backfills.
 

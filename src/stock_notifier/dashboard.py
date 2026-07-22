@@ -307,6 +307,83 @@ def _symbol_matches(latest: pd.DataFrame, query: str, limit: int = 8) -> pd.Data
     )
 
 
+def _global_symbol_matches(query: str, limit: int = 8) -> pd.DataFrame:
+    normalized_query = query.strip().upper()
+    if not normalized_query:
+        return pd.DataFrame()
+    like_query = f"%{normalized_query}%"
+    starts_query = f"{normalized_query}%"
+    return read_frame(
+        """
+        SELECT s.ticker,
+               COALESCE(NULLIF(p.name, ''), s.name) AS name,
+               s.asset_type,
+               p.sic_description,
+               COALESCE(m.price, latest.close) AS close,
+               COALESCE(
+                   m.percent_change,
+                   ROUND(100.0 * (latest.close / previous.close - 1.0), 2)
+               ) AS daily_change_pct,
+               CASE
+                   WHEN upper(s.ticker)=? THEN 0
+                   WHEN upper(s.ticker) LIKE ? THEN 1
+                   WHEN upper(s.ticker) LIKE ? THEN 2
+                   WHEN upper(COALESCE(NULLIF(p.name, ''), s.name)) LIKE ? THEN 3
+                   ELSE 4
+               END AS match_rank
+        FROM symbols s
+        LEFT JOIN company_profiles p ON p.ticker=s.ticker
+        LEFT JOIN market_snapshots m ON m.symbol=s.ticker
+        LEFT JOIN (
+            SELECT b.symbol, b.close
+            FROM daily_bars b
+            JOIN (
+                SELECT symbol, MAX(trading_date) AS trading_date
+                FROM daily_bars
+                GROUP BY symbol
+            ) latest_dates
+              ON latest_dates.symbol=b.symbol
+             AND latest_dates.trading_date=b.trading_date
+        ) latest ON latest.symbol=s.ticker
+        LEFT JOIN (
+            SELECT b.symbol, b.close
+            FROM daily_bars b
+            JOIN (
+                SELECT b2.symbol, MAX(b2.trading_date) AS trading_date
+                FROM daily_bars b2
+                JOIN (
+                    SELECT symbol, MAX(trading_date) AS trading_date
+                    FROM daily_bars
+                    GROUP BY symbol
+                ) latest_dates
+                  ON latest_dates.symbol=b2.symbol
+                 AND b2.trading_date < latest_dates.trading_date
+                GROUP BY b2.symbol
+            ) previous_dates
+              ON previous_dates.symbol=b.symbol
+             AND previous_dates.trading_date=b.trading_date
+        ) previous ON previous.symbol=s.ticker
+        WHERE s.active=1
+          AND (
+              upper(s.ticker) LIKE ?
+              OR upper(COALESCE(NULLIF(p.name, ''), s.name)) LIKE ?
+          )
+        ORDER BY match_rank, s.ticker
+        LIMIT ?
+        """,
+        (
+            normalized_query,
+            starts_query,
+            like_query,
+            starts_query,
+            like_query,
+            like_query,
+            int(limit),
+        ),
+        db_cache_key=_db_cache_key(),
+    ).drop(columns=["match_rank"], errors="ignore")
+
+
 def _app_setting(key: str, default: object) -> object:
     return database.get_app_setting(f"dashboard.{key}", default)
 
@@ -653,6 +730,222 @@ def _render_price_volume_chart(history: pd.DataFrame, selected: str) -> None:
         .properties(height=130)
     )
     st.altair_chart(alt.vconcat(price, volume).resolve_scale(x="shared"), use_container_width=True)
+
+
+def _stock_detail_summary(symbol: str) -> dict[str, object] | None:
+    rows = database.query(
+        """
+        SELECT s.ticker,
+               COALESCE(NULLIF(p.name, ''), s.name) AS name,
+               s.exchange,
+               s.asset_type,
+               p.market,
+               p.locale,
+               p.primary_exchange,
+               p.type AS profile_type,
+               p.active AS profile_active,
+               p.currency_name,
+               p.sic_code,
+               p.sic_description,
+               p.market_cap,
+               p.total_employees,
+               p.homepage_url,
+               p.description,
+               p.list_date,
+               p.updated_at AS profile_updated_at,
+               m.snapshot_at,
+               m.fetched_at AS snapshot_fetched_at,
+               m.price,
+               m.day_open,
+               m.day_high,
+               m.day_low,
+               m.day_close,
+               m.day_volume,
+               m.previous_close,
+               m.percent_change,
+               m.minute_volume
+        FROM symbols s
+        LEFT JOIN company_profiles p ON p.ticker=s.ticker
+        LEFT JOIN market_snapshots m ON m.symbol=s.ticker
+        WHERE s.ticker=?
+        LIMIT 1
+        """,
+        (symbol.upper().strip(),),
+    )
+    return dict(rows[0]) if rows else None
+
+
+def _stock_detail_lists(symbol: str) -> pd.DataFrame:
+    return read_frame(
+        """
+        SELECT l.name, l.description, m.added_at
+        FROM symbol_list_members m
+        JOIN symbol_lists l ON l.id=m.list_id
+        WHERE m.symbol=?
+        ORDER BY l.name
+        """,
+        (symbol.upper().strip(),),
+        db_cache_key=_db_cache_key(),
+    )
+
+
+def _stock_detail_scores(symbol: str) -> pd.DataFrame:
+    return read_frame(
+        """
+        SELECT id, created_at, signal_name, trading_date, close, score, eligible, message
+        FROM signal_scores
+        WHERE symbol=? AND is_latest=1
+        ORDER BY score DESC, signal_name
+        """,
+        (symbol.upper().strip(),),
+        db_cache_key=_db_cache_key(),
+    )
+
+
+def _stock_detail_components(score_id: int) -> pd.DataFrame:
+    return read_frame(
+        """
+        SELECT component_name, component_type, mode, value, passed,
+               component_score, weight, contribution, message
+        FROM signal_score_components
+        WHERE score_id=?
+        ORDER BY id
+        """,
+        (int(score_id),),
+        db_cache_key=_db_cache_key(),
+    )
+
+
+def _stock_detail_alerts(symbol: str) -> pd.DataFrame:
+    return read_frame(
+        """
+        SELECT created_at, direction, signal_name, score, threshold, trading_date, close, message
+        FROM alerts
+        WHERE symbol=?
+        ORDER BY id DESC
+        LIMIT 20
+        """,
+        (symbol.upper().strip(),),
+        db_cache_key=_db_cache_key(),
+    )
+
+
+def _refresh_stock_profile(symbol: str) -> str:
+    if not settings.massive_api_key:
+        return "MASSIVE_API_KEY is missing."
+    provider = MassiveClient(
+        settings.massive_api_key,
+        base_url=settings.massive_base_url,
+        requests_per_minute=settings.profile_requests_per_minute,
+        timeout_seconds=settings.http_timeout_seconds,
+    )
+    profile = provider.ticker_overview(symbol)
+    if profile is None:
+        database.mark_company_profile_unavailable(symbol)
+        st.cache_data.clear()
+        return f"{symbol} profile was not found; marked unavailable."
+    database.ensure_symbols([profile.ticker])
+    database.upsert_company_profile(profile)
+    st.cache_data.clear()
+    return f"{profile.ticker} profile refreshed."
+
+
+def _render_stock_detail(symbol: str) -> None:
+    symbol = symbol.upper().strip()
+    summary = _stock_detail_summary(symbol)
+    if not summary:
+        st.warning(f"{symbol} is not in the current symbol universe.")
+        return
+
+    name = str(summary.get("name") or "").strip()
+    st.markdown(f"### {symbol}" + (f" · {name}" if name else ""))
+    action_cols = st.columns([1, 1, 2])
+    with action_cols[0]:
+        if st.button("Refresh profile", key=f"refresh_profile_{symbol}", use_container_width=True):
+            try:
+                st.success(_refresh_stock_profile(symbol))
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Profile refresh failed: {exc}")
+    with action_cols[1]:
+        if st.button("Close details", key=f"close_details_{symbol}", use_container_width=True):
+            st.session_state.market_detail_symbol = None
+            st.rerun()
+    with action_cols[2]:
+        st.markdown(
+            f"[TradingView](https://www.tradingview.com/chart/?symbol={symbol}) · "
+            f"[Yahoo Finance](https://finance.yahoo.com/quote/{symbol})"
+        )
+
+    price = summary.get("price")
+    previous_close = summary.get("previous_close")
+    day_volume = summary.get("day_volume")
+    percent_change = summary.get("percent_change")
+    dollar_volume = (float(price or 0) * float(day_volume or 0)) if price is not None and day_volume is not None else None
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Price", f"${float(price):,.2f}" if price is not None else "—")
+    metric_cols[1].metric("Change", f"{float(percent_change):+.2f}%" if percent_change is not None else "—")
+    metric_cols[2].metric("Previous close", f"${float(previous_close):,.2f}" if previous_close is not None else "—")
+    metric_cols[3].metric("Volume", f"{float(day_volume):,.0f}" if day_volume is not None else "—")
+    metric_cols[4].metric("Dollar volume", f"${float(dollar_volume):,.0f}" if dollar_volume is not None else "—")
+
+    meta_cols = st.columns(4)
+    meta_cols[0].metric("Asset type", str(summary.get("asset_type") or summary.get("profile_type") or "—"))
+    meta_cols[1].metric("Exchange", str(summary.get("primary_exchange") or summary.get("exchange") or "—"))
+    market_cap = summary.get("market_cap")
+    meta_cols[2].metric("Market cap", f"${float(market_cap):,.0f}" if market_cap is not None else "—")
+    meta_cols[3].metric("Sector/SIC", str(summary.get("sic_description") or "—")[:40])
+    st.caption(
+        f"Snapshot: {_format_timestamp(summary.get('snapshot_at')) or '—'} · "
+        f"Fetched: {_format_timestamp(summary.get('snapshot_fetched_at')) or '—'} · "
+        f"Profile: {_format_timestamp(summary.get('profile_updated_at')) or '—'}"
+    )
+
+    description = str(summary.get("description") or "").strip()
+    if description:
+        with st.expander("Company description", expanded=False):
+            st.write(description)
+            homepage = str(summary.get("homepage_url") or "").strip()
+            if homepage:
+                st.markdown(f"[Company website]({homepage})")
+
+    list_frame = _stock_detail_lists(symbol)
+    score_frame = _stock_detail_scores(symbol)
+    alert_frame = _stock_detail_alerts(symbol)
+    cols = st.columns(3)
+    with cols[0]:
+        st.markdown("#### Lists")
+        if list_frame.empty:
+            st.info("Not in any custom list.")
+        else:
+            st.dataframe(_display_history_frame(list_frame), use_container_width=True, hide_index=True)
+    with cols[1]:
+        st.markdown("#### Latest signal scores")
+        if score_frame.empty:
+            st.info("No latest scores for this symbol.")
+        else:
+            display_scores = score_frame.drop(columns=["id"], errors="ignore")
+            st.dataframe(_display_history_frame(display_scores), use_container_width=True, hide_index=True)
+    with cols[2]:
+        st.markdown("#### Recent alerts")
+        if alert_frame.empty:
+            st.info("No recent alerts for this symbol.")
+        else:
+            st.dataframe(_display_history_frame(alert_frame), use_container_width=True, hide_index=True)
+
+    if not score_frame.empty:
+        score_options = [
+            f"{row['signal_name']} · {float(row['score']):.1f}"
+            for row in score_frame.to_dict("records")
+        ]
+        selected_score_label = st.selectbox("Score component breakdown", score_options, key=f"detail_score_{symbol}")
+        selected_index = score_options.index(selected_score_label)
+        score_id = int(score_frame.iloc[selected_index]["id"])
+        components = _stock_detail_components(score_id)
+        if components.empty:
+            st.info("No component breakdown saved for this score.")
+        else:
+            st.dataframe(_display_component_breakdown_frame(components.to_dict("records")), use_container_width=True, hide_index=True)
 
 
 def _list_member_frame(list_id: int, latest: pd.DataFrame) -> pd.DataFrame:
@@ -3097,14 +3390,48 @@ if selected_page == "Market data":
 
         st.subheader(view_title)
         st.caption(view_caption)
+        st.markdown("#### Stock lookup")
+        lookup_cols = st.columns([2, 1])
+        detail_query = lookup_cols[0].text_input(
+            "Search any symbol or company",
+            placeholder="Type a ticker or company name, e.g. NVDA or Nvidia",
+            key="market_detail_search",
+            help="Searches the full active Stocks universe, not only the currently selected table/list view.",
+        )
+        detail_matches = _global_symbol_matches(detail_query, limit=8) if detail_query.strip() else pd.DataFrame()
+        if detail_query.strip() and detail_matches.empty:
+            lookup_cols[1].warning("No matching active symbols.")
+        elif not detail_matches.empty:
+            lookup_cols[1].caption("Open closest matches")
+            match_columns = st.columns(4)
+            for index, row in detail_matches.reset_index(drop=True).iterrows():
+                ticker = str(row["ticker"])
+                name = str(row.get("name") or "").strip()
+                label = ticker if not name else f"{ticker} · {name[:28]}"
+                with match_columns[index % len(match_columns)]:
+                    if st.button(label, key=f"detail_match_{ticker}", use_container_width=True):
+                        st.session_state.market_detail_symbol = ticker
+                        st.session_state.market_selected_symbol = ticker
+                        st.session_state.market_chart_loaded_symbol = None
+                        st.rerun()
+
+        detail_symbol = str(st.session_state.get("market_detail_symbol") or "").upper().strip()
+        if detail_symbol:
+            _render_stock_detail(detail_symbol)
+
         if visible_latest.empty:
             st.info("No symbols to show for this view yet. Add symbols in the Lists tab or refresh market data.")
         else:
-            st.dataframe(
-                _display_market_data_frame(visible_latest),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
+            st.caption("Tip: click/select a row to open its stock details. Use the search above for symbols outside the selected view.")
+            market_display = _display_market_data_frame(visible_latest)
+            dataframe_kwargs = {
+                "use_container_width": True,
+                "hide_index": True,
+                "column_config": {
+                    "Ticker": st.column_config.TextColumn(
+                        "Ticker",
+                        help="Select a row to open stock details.",
+                    ),
                     "Close": st.column_config.NumberColumn(format="$%.2f"),
                     "Previous close": st.column_config.NumberColumn(format="$%.2f"),
                     "Volume": st.column_config.NumberColumn(format="%.0f"),
@@ -3112,12 +3439,37 @@ if selected_page == "Market data":
                     "Dollar volume": st.column_config.NumberColumn(format="$%.0f"),
                     "Market cap": st.column_config.NumberColumn(format="$%.0f"),
                 },
-            )
+            }
+            try:
+                table_event = st.dataframe(
+                    market_display,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="market_data_table",
+                    **dataframe_kwargs,
+                )
+                selection = getattr(table_event, "selection", None)
+                if selection is None and isinstance(table_event, dict):
+                    selection = table_event.get("selection", {})
+                selected_rows = (
+                    list(selection.get("rows", []) or [])
+                    if isinstance(selection, dict)
+                    else list(getattr(selection, "rows", []) or [])
+                )
+                if selected_rows:
+                    selected_ticker = str(market_display.iloc[int(selected_rows[0])]["Ticker"])
+                    if selected_ticker and selected_ticker != st.session_state.get("market_detail_symbol"):
+                        st.session_state.market_detail_symbol = selected_ticker
+                        st.session_state.market_selected_symbol = selected_ticker
+                        st.session_state.market_chart_loaded_symbol = None
+                        st.rerun()
+            except TypeError:
+                st.dataframe(market_display, **dataframe_kwargs)
 
         if available:
-            st.subheader("Symbol history")
+            st.subheader("Symbol chart")
             query = st.text_input(
-                "Search symbol or company",
+                "Search symbol or company in selected view",
                 placeholder="Type a ticker or company name, e.g. NVDA or Nvidia",
             )
             matches = _symbol_matches(visible_latest, query)
@@ -3133,6 +3485,7 @@ if selected_page == "Market data":
                     with match_columns[index % len(match_columns)]:
                         if st.button(label, key=f"symbol_match_{ticker}", use_container_width=True):
                             st.session_state.market_selected_symbol = ticker
+                            st.session_state.market_detail_symbol = ticker
                             st.session_state.market_chart_loaded_symbol = None
                             st.rerun()
 
