@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Protocol
 
-from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot
+from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot, Symbol
 
 
 class MarketDataNotAvailableError(RuntimeError):
@@ -16,5 +16,14 @@ class MarketDataProvider(Protocol):
     def historical_daily(self, symbol: str, start: date, end: date) -> list[DailyBar]: ...
 
     def full_market_snapshot(self) -> list[MarketSnapshot]: ...
+
+    def reference_tickers(
+        self,
+        *,
+        active: bool = True,
+        market: str = "stocks",
+        limit: int = 1000,
+        max_pages: int | None = None,
+    ) -> list[Symbol]: ...
 
     def ticker_overview(self, symbol: str) -> CompanyProfile | None: ...

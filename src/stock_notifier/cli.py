@@ -26,6 +26,14 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("init-db", help="Create or upgrade the SQLite schema")
     subparsers.add_parser("sync-symbols", help="Upsert config/symbols.txt into SQLite")
 
+    reference_tickers = subparsers.add_parser(
+        "sync-reference-tickers",
+        help="Fetch active US stock tickers from Massive reference data into SQLite",
+    )
+    reference_tickers.add_argument("--include-inactive", action="store_true", help="Include inactive/delisted tickers")
+    reference_tickers.add_argument("--limit", type=int, default=1000, help="Massive page size, max 1000")
+    reference_tickers.add_argument("--max-pages", type=int, help="Optional safety cap for testing pagination")
+
     profiles = subparsers.add_parser("sync-profiles", help="Fetch Massive ticker overview metadata")
     profiles.add_argument("--symbols", help="Optional comma-separated subset")
     profiles.add_argument("--limit", type=int, default=100, help="Maximum missing profiles to fetch")
@@ -109,7 +117,14 @@ def _profile_provider(settings: Settings, requests_per_minute: int | None = None
 
 def main() -> None:
     args = _parser().parse_args()
-    require_api_key = args.command in {"fetch-daily", "backfill", "run-scan-cycle", "sync-profiles", "services-run-due"}
+    require_api_key = args.command in {
+        "fetch-daily",
+        "backfill",
+        "run-scan-cycle",
+        "sync-profiles",
+        "sync-reference-tickers",
+        "services-run-due",
+    }
     settings = Settings.from_env(require_api_key=require_api_key)
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
@@ -126,6 +141,14 @@ def main() -> None:
         print(f"Initialized {settings.db_path}")
     elif args.command == "sync-symbols":
         print(f"Synchronized {len(symbols)} symbols")
+    elif args.command == "sync-reference-tickers":
+        reference_symbols = _provider(settings).reference_tickers(
+            active=not args.include_inactive,
+            limit=args.limit,
+            max_pages=args.max_pages,
+        )
+        count = database.sync_symbols(reference_symbols)
+        print(f"Synchronized {count} Massive reference tickers")
     elif args.command == "sync-profiles":
         if args.symbols:
             profile_symbols = [

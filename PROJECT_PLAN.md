@@ -11,6 +11,7 @@ The Signal Notifier application now has the main US-focused MVP pieces implement
 
 - Oracle/Ubuntu deployment with Streamlit behind Caddy.
 - SQLite storage for symbols, lists, company profiles, daily bars, latest snapshots, short intraday snapshot history, signals, scores, alerts, notification deliveries, service runs, app settings, and scan-cycle runs.
+- Massive reference-ticker sync for active US stock universe metadata, plus full-market snapshot ingestion that refreshes tradable snapshot symbols without letting liquidity filters shrink the master universe.
 - Configurable Signal Builder with score components, gate/filter components, preview rankings, saved signal definitions, and signal-derived list creation.
 - Market Data view switching between the full stock universe and custom lists; custom list views load only the selected list's symbols.
 - Telegram notification engine with dry-run mode, Signal Builder test alerts, scheduled signal/service delivery, pending alerts, delivery history, and full scan-cycle integration.
@@ -20,7 +21,7 @@ The Signal Notifier application now has the main US-focused MVP pieces implement
 Massive full-market snapshot → latest snapshot + short intraday history → price/volume filters → grouped signal scoring → alert evaluation → Telegram/dry-run → run health
 ```
 
-- Services tab with persisted options for market snapshot ingestion, historical data backfill, and company profile ingestion.
+- Services tab with persisted options for market snapshot ingestion, historical data backfill, and company profile ingestion; historical/profile services can run one chunk or all remaining chunks automatically.
 - Service scheduler controls per service and per signal: enabled flag, frequency amount/unit, start/end time for minute schedules, weekday filters, and optional Telegram completion/error notices.
 - `stock-notifier services-run-due` CLI plus systemd timer files that wake every 5 minutes and execute whichever saved services or signals are due.
 - Scheduled signal processing uses Massive snapshot freshness caching: reuse recent snapshots within the 15-minute delayed-data window when possible, otherwise fetch the full-market snapshot once and update the signal universe before scoring.

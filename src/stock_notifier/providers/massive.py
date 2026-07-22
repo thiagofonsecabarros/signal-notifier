@@ -10,7 +10,7 @@ from typing import Any
 
 import requests
 
-from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot
+from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot, Symbol
 from stock_notifier.providers.base import MarketDataNotAvailableError
 
 LOGGER = logging.getLogger(__name__)
@@ -71,9 +71,8 @@ class MassiveClient:
         for attempt in range(self.max_attempts):
             self.rate_limiter.wait()
             try:
-                response = self.session.get(
-                    f"{self.base_url}{path}", params=request_params, timeout=self.timeout_seconds
-                )
+                url = path if path.startswith(("http://", "https://")) else f"{self.base_url}{path}"
+                response = self.session.get(url, params=request_params, timeout=self.timeout_seconds)
             except requests.RequestException as error:
                 last_error = error
                 if attempt == self.max_attempts - 1:
@@ -228,6 +227,50 @@ class MassiveClient:
             if snapshot is not None:
                 snapshots.append(snapshot)
         return snapshots
+
+    def reference_tickers(
+        self,
+        *,
+        active: bool = True,
+        market: str = "stocks",
+        limit: int = 1000,
+        max_pages: int | None = None,
+    ) -> list[Symbol]:
+        path = "/v3/reference/tickers"
+        params: dict[str, Any] = {
+            "market": market,
+            "active": str(active).lower(),
+            "order": "asc",
+            "limit": max(1, min(int(limit), 1000)),
+            "sort": "ticker",
+        }
+        symbols: list[Symbol] = []
+        pages = 0
+        while path:
+            payload = self._get(path, params)
+            pages += 1
+            for result in payload.get("results", []) or []:
+                if not isinstance(result, dict):
+                    continue
+                ticker = str(result.get("ticker") or "").upper().strip()
+                if not ticker:
+                    continue
+                symbols.append(
+                    Symbol(
+                        ticker=ticker,
+                        name=str(result.get("name") or ""),
+                        exchange=str(result.get("primary_exchange") or ""),
+                        asset_type=str(result.get("type") or "stock"),
+                    )
+                )
+            if max_pages is not None and pages >= max_pages:
+                break
+            next_url = str(payload.get("next_url") or "").strip()
+            if not next_url:
+                break
+            path = next_url
+            params = {}
+        return symbols
 
     def ticker_overview(self, symbol: str) -> CompanyProfile | None:
         normalized_symbol = symbol.upper()

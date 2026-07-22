@@ -188,6 +188,7 @@ Database and data ingestion:
 ```powershell
 stock-notifier init-db
 stock-notifier sync-symbols
+stock-notifier sync-reference-tickers
 stock-notifier sync-profiles --limit 100
 stock-notifier sync-profiles --limit 100 --requests-per-minute 240
 stock-notifier sync-profiles --symbols AAPL,MSFT,NVDA
@@ -195,6 +196,8 @@ stock-notifier fetch-daily
 stock-notifier fetch-daily --date 2026-07-08
 stock-notifier backfill --days 90 --symbols AAPL,MSFT,SPY
 ```
+
+`sync-symbols` loads the local `config/symbols.txt` starter list. `sync-reference-tickers` is the preferred paid-plan universe sync: it pages Massive's `/v3/reference/tickers?market=stocks&active=true` endpoint and populates the SQLite `symbols` table with active US stock tickers, names, exchange, and type metadata.
 
 `sync-profiles` uses `MASSIVE_PROFILE_REQUESTS_PER_MINUTE`, not the conservative `MASSIVE_REQUESTS_PER_MINUTE` used by normal market-data calls. On a paid Massive stocks plan, increasing profile sync to 120–240 requests/minute makes metadata backfills much faster.
 
@@ -205,9 +208,10 @@ The dashboard **Services** tab provides safer data-ingestion workflows for large
 Market snapshot ingestion:
 
 - uses Massive's full-market snapshot endpoint;
+- adds every fetched snapshot ticker to the `symbols` universe before applying filters;
 - stores lightweight fields: last price, change %, previous close, volume, and dollar volume;
 - can run for the full stock universe, selected lists, typed tickers, or lists plus typed tickers;
-- supports minimum price, volume, dollar-volume, and max-symbol filters;
+- supports minimum price, volume, dollar-volume, and max-symbol filters for stored snapshot rows, not for universe membership;
 - is the preferred first step before heavier enrichment jobs.
 
 Historical data ingestion:
@@ -225,10 +229,11 @@ Company profile ingestion:
 
 - choose `Stocks universe`, selected lists, typed tickers, or lists plus typed tickers;
 - run only missing profiles or refresh all selected profiles;
-- choose chunk size and requests/minute;
-- run the next chunk, preserving anything already loaded.
+- choose chunk size, requests/minute, and whether to run one chunk or all remaining chunks automatically;
+- estimates the selected run size and API time before running;
+- preserves anything already loaded and logs the run as `company_profiles` in **Latest runs → Service runs**.
 
-For the full stock universe, market snapshots are fast enough to run frequently. Company profiles are slower because they require one ticker-overview request per symbol; prefer repeated chunks or an overnight server job instead of one huge blocking dashboard run.
+For the full stock universe, market snapshots are fast enough to run frequently. Company profiles are slower because they require one ticker-overview request per symbol; prefer selected lists, safe request pacing, or the all-remaining option as a scheduled/overnight job instead of a huge interactive daytime dashboard run.
 
 Signal scoring:
 
@@ -322,7 +327,7 @@ The Lists tab is organized as a full-width workspace:
 6. **Create or update a list from a signal** — turn a saved signal into a reusable list.
 7. **Danger zone** — delete the selected list.
 
-The **Market data** tab lets you choose a single view with checkbox-style selectors:
+The **Market data** tab lets you choose a single view with checkbox-style selectors. Each selector shows the current symbol count, such as `Stocks universe (9,999 stocks)` or `Portfolio (12 stocks)`:
 
 - **Stocks universe** — the full active stock universe currently in the database.
 - Any custom list you created, such as `Portfolio`, `Potential`, or `Liquid Universe`.

@@ -298,6 +298,7 @@ def run_market_snapshot_service(database: Database, settings: Settings) -> tuple
     run_id = database.start_service_run("market_snapshot", scope=service_scope)
     try:
         snapshots = _provider(settings).full_market_snapshot()
+        universe_symbols = database.ensure_symbols(snapshot.symbol for snapshot in snapshots)
         scope_symbols = _snapshot_scope_symbols(database, scope=scope, selected_lists=selected_lists, typed_symbols=typed_symbols)
         filtered = [
             snapshot
@@ -309,7 +310,6 @@ def run_market_snapshot_service(database: Database, settings: Settings) -> tuple
         ]
         filtered.sort(key=_snapshot_dollar_volume, reverse=True)
         selected_snapshots = filtered[:max_store]
-        database.ensure_symbols(snapshot.symbol for snapshot in selected_snapshots)
         stored = database.upsert_market_snapshots(selected_snapshots)
         duration = time.monotonic() - started
         database.finish_service_run(
@@ -319,9 +319,13 @@ def run_market_snapshot_service(database: Database, settings: Settings) -> tuple
             success_count=stored,
             skipped_count=max(len(snapshots) - stored, 0),
             duration_seconds=duration,
-            message=f"scheduled=true, matched={len(filtered)}, stored={stored}",
+            message=f"scheduled=true, universe_symbols={universe_symbols}, matched={len(filtered)}, stored={stored}",
         )
-        return "success", f"Market snapshot scheduled run complete: fetched={len(snapshots):,}, matched={len(filtered):,}, stored={stored:,}, duration={duration:.1f}s", run_id
+        return "success", (
+            "Market snapshot scheduled run complete: "
+            f"fetched={len(snapshots):,}, universe_symbols={universe_symbols:,}, "
+            f"matched={len(filtered):,}, stored={stored:,}, duration={duration:.1f}s"
+        ), run_id
     except Exception as exc:
         database.finish_service_run(run_id, status="failed", error_count=1, duration_seconds=time.monotonic() - started, message=str(exc))
         return "failed", f"Market snapshot scheduled run failed: {exc}", run_id
@@ -340,12 +344,19 @@ def run_company_profiles_service(database: Database, settings: Settings) -> tupl
     typed_symbols = str(get_dashboard_setting(database, "services.profiles.typed_symbols", ""))
     mode = str(get_dashboard_setting(database, "services.profiles.mode", "Only missing profiles"))
     chunk_size = int(get_dashboard_setting(database, "services.profiles.chunk_size", 25))
+    run_all_remaining = bool(get_dashboard_setting(database, "services.profiles.run_all_remaining", False))
     requests_per_minute = int(get_dashboard_setting(database, "services.profiles.requests_per_minute", settings.profile_requests_per_minute))
     scope_symbols = _profile_scope_symbols(database, scope=scope, selected_lists=selected_lists, typed_symbols=typed_symbols)
     profiled = _symbols_with_profiles(database)
     pending = [symbol for symbol in scope_symbols if symbol not in profiled] if mode == "Only missing profiles" else scope_symbols
-    next_chunk = pending[: max(chunk_size, 1)]
-    service_scope = f"{scope}; scheduled=true; mode={mode}; chunk_size={chunk_size}; requests_per_minute={requests_per_minute}"
+    chunks_remaining = (len(pending) + max(chunk_size, 1) - 1) // max(chunk_size, 1)
+    run_chunk_count = chunks_remaining if run_all_remaining else min(1, chunks_remaining)
+    next_chunk = pending[: max(chunk_size, 1) * max(run_chunk_count, 0)]
+    service_scope = (
+        f"{scope}; scheduled=true; mode={mode}; chunk_size={chunk_size}; "
+        f"chunks_to_run={run_chunk_count}; run_all_remaining={run_all_remaining}; "
+        f"requests_per_minute={requests_per_minute}"
+    )
     run_id = database.start_service_run("company_profiles", scope=service_scope, requested_count=len(next_chunk))
     fetched = 0
     unavailable = 0
@@ -376,7 +387,12 @@ def run_company_profiles_service(database: Database, settings: Settings) -> tupl
             duration_seconds=duration,
             message=f"scheduled=true, fetched={fetched}, unavailable={unavailable}, errors={len(errors)}; " + "; ".join(errors[:5]),
         )
-        return status, f"Company profiles scheduled run complete: fetched={fetched}, unavailable={unavailable}, errors={len(errors)}, remaining={max(len(pending)-len(next_chunk), 0):,}, duration={duration:.1f}s", run_id
+        return status, (
+            "Company profiles scheduled run complete: "
+            f"fetched={fetched}, unavailable={unavailable}, errors={len(errors)}, "
+            f"chunks={run_chunk_count:,}, remaining={max(len(pending)-len(next_chunk), 0):,}, "
+            f"duration={duration:.1f}s"
+        ), run_id
     except Exception as exc:
         database.finish_service_run(run_id, status="failed", error_count=1, duration_seconds=time.monotonic() - started, message=str(exc))
         return "failed", f"Company profiles scheduled run failed: {exc}", run_id

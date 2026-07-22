@@ -1003,9 +1003,24 @@ def _render_lists_tab() -> None:
 
 
 def _market_view_options() -> list[dict[str, object]]:
-    options: list[dict[str, object]] = [{"kind": "universe", "label": "Stocks universe", "list_id": None}]
+    universe_count = len(database.active_symbols())
+    options: list[dict[str, object]] = [
+        {
+            "kind": "universe",
+            "label": "Stocks universe",
+            "display_label": f"Stocks universe ({universe_count:,} stocks)",
+            "list_id": None,
+            "symbol_count": universe_count,
+        }
+    ]
     options.extend(
-        {"kind": "list", "label": str(item["name"]), "list_id": int(item["id"])}
+        {
+            "kind": "list",
+            "label": str(item["name"]),
+            "display_label": f"{item['name']} ({int(item['symbol_count'] or 0):,} stocks)",
+            "list_id": int(item["id"]),
+            "symbol_count": int(item["symbol_count"] or 0),
+        }
         for item in database.list_symbol_lists()
     )
     return options
@@ -1025,12 +1040,14 @@ def _select_market_view() -> dict[str, object]:
     st.caption("Choose one view:")
     columns = st.columns(min(4, len(options)))
     checked_labels: list[str] = []
-    for index, label in enumerate(labels):
+    for index, option in enumerate(options):
+        label = labels[index]
+        display_label = str(option.get("display_label") or label)
         key = f"market_view_checkbox_{generation}_{index}"
         if key not in st.session_state:
             st.session_state[key] = label == selected_label
         with columns[index % len(columns)]:
-            checked = st.checkbox(label, key=key)
+            checked = st.checkbox(display_label, key=key)
         if checked:
             checked_labels.append(label)
 
@@ -2411,13 +2428,13 @@ def _render_services() -> None:
             help="Calculated as last price × day volume.",
         )
         max_store = filter_cols[3].number_input(
-            "Max symbols to store",
+            "Max snapshot rows to store",
             min_value=1,
             max_value=20_000,
             value=int(_app_setting("services.snapshot.max_store", 5_000)),
             step=500,
             key="snapshot_max_store",
-            help="Keeps the dashboard safe if you only want the most liquid names.",
+            help="Limits stored latest snapshot rows after filters. It does not limit which tickers are added to the Stocks universe.",
         )
         snapshot_defaults: dict[str, object] = {
             "services.snapshot.scope": snapshot_scope,
@@ -2433,8 +2450,8 @@ def _render_services() -> None:
         _save_app_settings(snapshot_defaults)
 
         st.caption(
-            "Tip: for a true universe foundation, use Stocks universe with low filters. "
-            "For signal scans on the E2.Micro, use tighter price/volume/dollar-volume filters."
+            "Tip: this service now adds every fetched snapshot ticker to the Stocks universe first. "
+            "Price/volume/max-store filters only limit which latest snapshot rows are stored for dashboard/scoring."
         )
 
         if st.button(
@@ -2458,6 +2475,7 @@ def _render_services() -> None:
                 )
                 with st.spinner("Fetching full-market snapshot from Massive..."):
                     snapshots = provider.full_market_snapshot()
+                universe_symbols = database.ensure_symbols(snapshot.symbol for snapshot in snapshots)
 
                 scope_symbols = _snapshot_scope_symbols(
                     scope=snapshot_scope,
@@ -2475,7 +2493,6 @@ def _render_services() -> None:
                 filtered.sort(key=_snapshot_dollar_volume, reverse=True)
                 selected_snapshots = filtered[: int(max_store)]
 
-                database.ensure_symbols(snapshot.symbol for snapshot in selected_snapshots)
                 stored = database.upsert_market_snapshots(selected_snapshots)
                 st.cache_data.clear()
                 duration = time.monotonic() - started
@@ -2486,11 +2503,11 @@ def _render_services() -> None:
                     success_count=stored,
                     skipped_count=max(len(snapshots) - stored, 0),
                     duration_seconds=duration,
-                    message=f"matched={len(filtered)}, stored={stored}",
+                    message=f"universe_symbols={universe_symbols}, matched={len(filtered)}, stored={stored}",
                 )
                 st.success(
                     "Market snapshot complete: "
-                    f"fetched={len(snapshots):,}, matched={len(filtered):,}, "
+                    f"fetched={len(snapshots):,}, universe_symbols={universe_symbols:,}, matched={len(filtered):,}, "
                     f"stored={stored:,}, duration={duration:.1f}s"
                 )
                 if selected_snapshots:
@@ -2856,10 +2873,20 @@ def _render_services() -> None:
             step=5,
             key="profile_preview_rows",
         )
+        run_all_remaining = st.checkbox(
+            "Run all remaining chunks automatically",
+            value=bool(_app_setting("services.profiles.run_all_remaining", False)),
+            key="profile_run_all_remaining",
+            help=(
+                "If enabled, the next run processes every remaining profile chunk for the selected scope/mode. "
+                "If disabled, it processes one chunk at a time."
+            ),
+        )
         profile_defaults: dict[str, object] = {
             "services.profiles.scope": scope,
             "services.profiles.mode": mode,
             "services.profiles.chunk_size": int(chunk_size),
+            "services.profiles.run_all_remaining": bool(run_all_remaining),
             "services.profiles.requests_per_minute": int(requests_per_minute),
             "services.profiles.preview_rows": int(show_preview_limit),
         }
@@ -2880,23 +2907,29 @@ def _render_services() -> None:
             if mode == "Only missing profiles"
             else scope_symbols
         )
-        next_chunk = pending_symbols[: int(chunk_size)]
+        chunks_remaining = (len(pending_symbols) + int(chunk_size) - 1) // max(int(chunk_size), 1)
+        run_chunk_count = chunks_remaining if run_all_remaining else min(1, chunks_remaining)
+        symbols_to_run = pending_symbols[: int(chunk_size) * max(run_chunk_count, 0)]
 
-        metric_cols = st.columns(4)
+        metric_cols = st.columns(5)
         metric_cols[0].metric("Scope symbols", f"{len(scope_symbols):,}")
         metric_cols[1].metric("Already profiled", f"{len(set(scope_symbols) & profiled):,}")
         metric_cols[2].metric("Remaining for mode", f"{len(pending_symbols):,}")
-        metric_cols[3].metric("Next chunk", f"{len(next_chunk):,}")
+        metric_cols[3].metric("This run", f"{len(symbols_to_run):,}")
+        metric_cols[4].metric("Chunks left", f"{chunks_remaining:,}")
 
         if scope_symbols:
             coverage_pct = 100.0 * len(set(scope_symbols) & profiled) / max(len(scope_symbols), 1)
             st.progress(min(coverage_pct / 100.0, 1.0), text=f"Profile coverage: {coverage_pct:.1f}%")
 
         if pending_symbols:
-            estimated_minutes = len(pending_symbols) / max(int(requests_per_minute), 1)
+            estimated_minutes_total = len(pending_symbols) / max(int(requests_per_minute), 1)
+            estimated_minutes_run = len(symbols_to_run) / max(int(requests_per_minute), 1)
             st.caption(
-                f"Estimated API time remaining at {int(requests_per_minute):,} requests/min: "
-                f"{estimated_minutes:.1f} minutes before network/API overhead."
+                f"Estimated API time at {int(requests_per_minute):,} requests/min: "
+                f"{estimated_minutes_total:.1f} min total remaining, "
+                f"{estimated_minutes_run:.1f} min for this run before network/API overhead. "
+                f"This run will process {len(symbols_to_run):,} symbol(s) across {run_chunk_count:,} chunk(s)."
             )
 
         preview_symbols = pending_symbols[: int(show_preview_limit)]
@@ -2914,38 +2947,42 @@ def _render_services() -> None:
             st.info("Select a scope with at least one symbol.")
 
         if st.button(
-            "Run next profile chunk",
+            "Run profile ingestion",
             type="primary",
             use_container_width=True,
-            disabled=not bool(settings.massive_api_key and next_chunk),
+            disabled=not bool(settings.massive_api_key and symbols_to_run),
         ):
             service_scope = (
                 f"{scope}; mode={mode}; chunk_size={chunk_size}; "
+                f"chunks_to_run={run_chunk_count}; run_all_remaining={run_all_remaining}; "
                 f"requests_per_minute={requests_per_minute}"
             )
             service_run_id = database.start_service_run(
                 "company_profiles",
                 scope=service_scope,
-                requested_count=len(next_chunk),
+                requested_count=len(symbols_to_run),
             )
             try:
-                result = _sync_profile_chunk(next_chunk, requests_per_minute=int(requests_per_minute))
+                result = _sync_profile_chunk(symbols_to_run, requests_per_minute=int(requests_per_minute))
                 errors = result["errors"]
                 status = "partial" if errors else "success"
                 database.finish_service_run(
                     service_run_id,
                     status=status,
-                    processed_count=len(next_chunk),
+                    processed_count=len(symbols_to_run),
                     success_count=int(result["fetched"]),
                     skipped_count=int(result["unavailable"]),
                     error_count=len(errors),
                     duration_seconds=float(result["duration"]),
-                    message=f"fetched={result['fetched']}, unavailable={result['unavailable']}, errors={len(errors)}",
+                    message=(
+                        f"fetched={result['fetched']}, unavailable={result['unavailable']}, "
+                        f"chunks={run_chunk_count}, errors={len(errors)}"
+                    ),
                 )
                 st.success(
-                    "Profile chunk complete: "
+                    "Profile ingestion complete: "
                     f"fetched={result['fetched']}, unavailable={result['unavailable']}, "
-                    f"errors={len(errors)}, duration={float(result['duration']):.1f}s"
+                    f"chunks={run_chunk_count}, errors={len(errors)}, duration={float(result['duration']):.1f}s"
                 )
                 if errors:
                     st.error("Some symbols failed. They were not marked unavailable and can be retried.")
@@ -3034,7 +3071,7 @@ if selected_page == "Market data":
     view_title = "Stocks universe"
     view_caption = "General list of active symbols."
     requested_market_symbols: set[str] | None = None
-    member_count = 0
+    member_count = int(selected_view.get("symbol_count") or 0)
     if selected_view["kind"] == "list" and selected_view["list_id"] is not None:
         list_id = int(selected_view["list_id"])
         requested_market_symbols = set(database.symbols_in_list(list_id))
@@ -3044,7 +3081,9 @@ if selected_page == "Market data":
     latest = _latest_watchlist(requested_market_symbols)
     visible_latest = latest
     if selected_view["kind"] == "list" and selected_view["list_id"] is not None:
-        view_caption = f"{member_count} saved symbol(s); {len(visible_latest)} currently visible with market data."
+        view_caption = f"{member_count:,} saved stock(s); {len(visible_latest):,} currently visible with market data."
+    else:
+        view_caption = f"General list of active symbols: {member_count:,} stock(s); {len(visible_latest):,} currently visible with market data."
 
     if latest.empty and requested_market_symbols is None:
         st.warning("No database data yet. Run `stock-notifier fetch-daily` or a backfill first.")
