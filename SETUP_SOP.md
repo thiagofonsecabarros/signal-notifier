@@ -149,6 +149,9 @@ sudo -u stocknotifier sqlite3 /opt/stock-notifier/data/stock_notifier.db \
   on the server before copying individual files into it.
 - If a deployment changes systemd service/timer files, copy the changed files to `/etc/systemd/system/`
   and run `sudo systemctl daemon-reload`. Normal dashboard schedule edits do not need this.
+- Before any deployment that changes SQLite schema, create a server-side DB backup. Use `stock-notifier init-db`
+  to add missing tables/columns; do not replace the cloud DB with a local DB unless intentionally restoring
+  from backup.
 - Rotate the Massive key immediately if it appears in shell history, logs, screenshots, or Git.
 - Apply Ubuntu security updates monthly and reboot when `/var/run/reboot-required` exists.
 
@@ -174,10 +177,12 @@ sudo -u stocknotifier sqlite3 /opt/stock-notifier/data/stock_notifier.db \
    Latest runs delivery history.
 4. **Phase 4 — delayed intraday:** Massive full-market snapshots, short intraday snapshot history,
    VM-safe filtering, grouped scoring, scan-cycle runs, and 15-minute timer support.
-5. **Phase 5 — schedulers:** dashboard-managed market snapshot, historical backfill, and company
-   profile ingestion; persisted service options; per-signal scheduler controls; service/signal-run
-   logging; optional Telegram completion/error notifications and top-10 signal digests.
-6. **Phase 6 — hardening and scale:** production benchmark tuning, larger/liquid universes,
+5. **Phase 5 — schedulers:** dashboard-managed market snapshot, price-target ingestion, historical
+   backfill, and company profile ingestion; persisted service options; per-signal scheduler controls;
+   service/signal-run logging; optional Telegram completion/error notifications and top-10 signal digests.
+6. **Phase 6 — price-target context:** import/export existing Investment Analysis target rows,
+   show average target in Market Data, and show brokerage targets in Stock details.
+7. **Phase 7 — hardening and scale:** production benchmark tuning, larger/liquid universes,
    signal performance analytics/backtesting, richer progress/cancel behavior, and later Canadian
    provider support.
 

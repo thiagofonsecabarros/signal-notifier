@@ -14,17 +14,20 @@ from stock_notifier.notifications.service import scan_alerts
 from stock_notifier.notifications.telegram import TelegramClient
 from stock_notifier.providers.massive import MassiveClient
 from stock_notifier.scoring.service import score_signal
+from stock_notifier.services.price_targets import fetch_and_store_price_targets
 
-SERVICE_KEYS = ["snapshot", "historical", "profiles"]
+SERVICE_KEYS = ["snapshot", "historical", "profiles", "price_targets"]
 SERVICE_LABELS = {
     "snapshot": "Market snapshot",
     "historical": "Historical data",
     "profiles": "Company profiles",
+    "price_targets": "Price targets",
 }
 SERVICE_RUN_NAMES = {
     "snapshot": "market_snapshot",
     "historical": "historical_data",
     "profiles": "company_profiles",
+    "price_targets": "price_targets",
 }
 SCHEDULE_UNITS = ["minutes", "hours", "days", "business_days", "weeks"]
 SIGNAL_SNAPSHOT_FRESH_MINUTES = 14
@@ -472,6 +475,46 @@ def run_historical_data_service(database: Database, settings: Settings) -> tuple
         return "failed", f"Historical data scheduled run failed: {exc}", run_id
 
 
+def run_price_targets_service(database: Database, settings: Settings) -> tuple[str, str, int | None]:
+    started = time.monotonic()
+    source_url = str(get_dashboard_setting(database, "services.price_targets.source_url", "https://www.pricetargets.com/"))
+    timeout_seconds = int(get_dashboard_setting(database, "services.price_targets.timeout_seconds", 45))
+    allow_unknown = bool(get_dashboard_setting(database, "services.price_targets.allow_unknown_symbols", False))
+    service_scope = f"source_url={source_url}; allow_unknown_symbols={allow_unknown}"
+    run_id = database.start_service_run("price_targets", scope=service_scope)
+    try:
+        result = fetch_and_store_price_targets(
+            database,
+            source_url=source_url,
+            timeout_seconds=timeout_seconds,
+            allow_unknown_symbols=allow_unknown,
+        )
+        duration = time.monotonic() - started
+        status = "success" if result.stored_latest or result.stored_events else "partial"
+        database.finish_service_run(
+            run_id,
+            status=status,
+            processed_count=result.fetched,
+            success_count=result.stored_latest,
+            skipped_count=result.skipped_unknown,
+            error_count=0,
+            duration_seconds=duration,
+            message=(
+                f"scheduled=true, fetched={result.fetched}, stored_latest={result.stored_latest}, "
+                f"stored_events={result.stored_events}, skipped_unknown={result.skipped_unknown}"
+            ),
+        )
+        return status, (
+            "Price targets scheduled run complete: "
+            f"fetched={result.fetched:,}, stored_latest={result.stored_latest:,}, "
+            f"events={result.stored_events:,}, skipped_unknown={result.skipped_unknown:,}, "
+            f"duration={duration:.1f}s"
+        ), run_id
+    except Exception as exc:
+        database.finish_service_run(run_id, status="failed", error_count=1, duration_seconds=time.monotonic() - started, message=str(exc))
+        return "failed", f"Price targets scheduled run failed: {exc}", run_id
+
+
 def _send_service_notification(database: Database, settings: Settings, *, service_key: str, status: str, message: str) -> bool:
     schedule = get_service_schedule(database, service_key)
     if not bool(schedule.get("notify_telegram")):
@@ -525,6 +568,8 @@ def run_service(database: Database, settings: Settings, service_key: str) -> Sch
         status, message, run_id = run_historical_data_service(database, settings)
     elif service_key == "profiles":
         status, message, run_id = run_company_profiles_service(database, settings)
+    elif service_key == "price_targets":
+        status, message, run_id = run_price_targets_service(database, settings)
     else:
         raise ValueError(f"Unsupported service key: {service_key}")
     set_dashboard_setting(database, f"services.{service_key}.last_scheduled_run_at", datetime.now(UTC).isoformat())

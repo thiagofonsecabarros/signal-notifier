@@ -18,6 +18,7 @@ from stock_notifier.notifications.schedule import next_eligible_send_at, parse_s
 from stock_notifier.providers.massive import MassiveClient
 from stock_notifier.scoring.engine import SignalDefinition, evaluate_signal
 from stock_notifier.scoring.service import required_history_bars, score_signal, seed_starter_signals
+from stock_notifier.services.price_targets import fetch_and_store_price_targets
 from stock_notifier.services.scheduler import (
     SCHEDULE_UNITS,
     get_service_schedule,
@@ -203,6 +204,7 @@ def _display_market_data_frame(frame: pd.DataFrame) -> pd.DataFrame:
             "volume": "Volume",
             "daily_change_pct": "Daily change %",
             "dollar_volume": "Dollar volume",
+            "average_price_target": "Price Target",
         }
     )
 
@@ -272,6 +274,12 @@ def _latest_watchlist(symbols: set[str] | None = None) -> pd.DataFrame:
               ON latest.symbol = b.symbol
              AND b.trading_date < latest.trading_date
             GROUP BY b.symbol
+        ),
+        target_averages AS (
+            SELECT symbol, AVG(target_price) AS average_price_target
+            FROM price_targets_latest
+            WHERE target_price IS NOT NULL AND target_price > 0
+            GROUP BY symbol
         )
         SELECT s.ticker,
                COALESCE(NULLIF(p.name, ''), s.name) AS name,
@@ -286,10 +294,12 @@ def _latest_watchlist(symbols: set[str] | None = None) -> pd.DataFrame:
                    m.percent_change,
                    ROUND(100.0 * (current.close / previous.close - 1.0), 2)
                ) AS daily_change_pct,
-               COALESCE(m.price, current.close) * COALESCE(m.day_volume, current.volume, 0) AS dollar_volume
+               COALESCE(m.price, current.close) * COALESCE(m.day_volume, current.volume, 0) AS dollar_volume,
+               target_averages.average_price_target
         FROM symbols s
         LEFT JOIN company_profiles p ON p.ticker = s.ticker
         LEFT JOIN market_snapshots m ON m.symbol = s.ticker
+        LEFT JOIN target_averages ON target_averages.symbol = s.ticker
         LEFT JOIN latest_dates latest ON latest.symbol = s.ticker
         LEFT JOIN daily_bars current
           ON current.symbol = latest.symbol
@@ -867,6 +877,65 @@ def _stock_detail_alerts(symbol: str) -> pd.DataFrame:
     )
 
 
+def _stock_detail_price_targets(symbol: str) -> pd.DataFrame:
+    rows = database.price_targets_for_symbol(symbol)
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    for column in ["target_price", "previous_target_price", "price_then", "source_current_price", "price_now"]:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if {"price_now", "price_then"}.issubset(frame.columns):
+        frame["change_since_target_pct"] = (
+            (frame["price_now"] - frame["price_then"]) / frame["price_then"] * 100.0
+        ).where(frame["price_then"].notna() & (frame["price_then"] != 0))
+    if {"target_price", "price_now"}.issubset(frame.columns):
+        frame["target_upside_pct"] = (
+            (frame["target_price"] - frame["price_now"]) / frame["price_now"] * 100.0
+        ).where(frame["price_now"].notna() & (frame["price_now"] != 0))
+    frame["reached"] = frame.get("reached_date", pd.Series(dtype=object)).fillna("").astype(str).str.len() > 0
+    display_columns = [
+        "brokerage",
+        "action",
+        "rating",
+        "effective_date",
+        "price_then",
+        "price_now",
+        "change_since_target_pct",
+        "target_price",
+        "target_upside_pct",
+        "reached",
+        "reached_date",
+        "captured_at",
+    ]
+    return frame[[column for column in display_columns if column in frame.columns]]
+
+
+def _style_price_targets(frame: pd.DataFrame) -> object:
+    if frame.empty:
+        return frame
+    display = _display_history_frame(frame)
+    formatters = {
+        "Price Then": "${:,.2f}",
+        "Price Now": "${:,.2f}",
+        "Target Price": "${:,.2f}",
+        "Change Since Target %": "{:+.2f}%",
+        "Target Upside %": "{:+.2f}%",
+    }
+    available_formatters = {key: value for key, value in formatters.items() if key in display.columns}
+    styled = display.style.format(available_formatters, na_rep="")
+    if "Reached" in display.columns:
+        def _highlight_reached(row: pd.Series) -> list[str]:
+            reached = bool(row.get("Reached"))
+            return ["background-color: #dcfce7" if reached else "" for _ in row]
+
+        styled = styled.apply(_highlight_reached, axis=1)
+    for column in ["Change Since Target %", "Target Upside %"]:
+        if column in display.columns:
+            styled = styled.applymap(_percent_color, subset=[column])
+    return styled
+
+
 def _refresh_stock_profile(symbol: str) -> str:
     if not settings.massive_api_key:
         return "MASSIVE_API_KEY is missing."
@@ -949,6 +1018,24 @@ def _render_stock_detail(symbol: str) -> None:
             homepage = str(summary.get("homepage_url") or "").strip()
             if homepage:
                 st.markdown(f"[Company website]({homepage})")
+
+    st.markdown("#### Brokerage price targets")
+    target_frame = _stock_detail_price_targets(symbol)
+    if target_frame.empty:
+        st.info("No brokerage price targets stored for this symbol yet.")
+    else:
+        st.dataframe(
+            _style_price_targets(target_frame),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Price Then": st.column_config.NumberColumn(format="$%.2f"),
+                "Price Now": st.column_config.NumberColumn(format="$%.2f"),
+                "Target Price": st.column_config.NumberColumn(format="$%.2f"),
+                "Change Since Target %": st.column_config.NumberColumn(format="%.2f%%"),
+                "Target Upside %": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
 
     st.markdown("#### Symbol chart")
     st.caption("Chart history loads automatically for the opened stock detail and is cached per symbol.")
@@ -2914,6 +3001,108 @@ def _render_services() -> None:
                 )
                 st.cache_data.clear()
                 st.error(f"Market snapshot failed: {exc}")
+
+    with st.expander("Data ingestion: price targets", expanded=False):
+        st.markdown(
+            "Fetch the latest brokerage price-target rows from PriceTargets.com and store the latest "
+            "target per symbol/brokerage plus a deduplicated event history. This powers the Market Data "
+            "average price target and the Brokerage price targets table in stock details."
+        )
+        _render_service_scheduler("price_targets", "price targets")
+
+        status = database.price_target_service_status()
+        status_cols = st.columns(4)
+        status_cols[0].metric("Latest target rows", f"{int(status.get('latest_count') or 0):,}")
+        status_cols[1].metric("Symbols covered", f"{int(status.get('symbol_count') or 0):,}")
+        status_cols[2].metric("Latest target date", str(status.get("latest_effective_date") or "—"))
+        status_cols[3].metric("Last captured", _format_timestamp(status.get("latest_captured_at")) or "—")
+
+        target_cols = st.columns([2, 1, 1])
+        source_url = target_cols[0].text_input(
+            "Source URL",
+            value=str(_app_setting("services.price_targets.source_url", "https://www.pricetargets.com/")),
+            key="price_targets_source_url",
+            help="Default is PriceTargets.com. Keep this unchanged unless the source page changes.",
+        )
+        timeout_seconds = target_cols[1].number_input(
+            "Timeout seconds",
+            min_value=10,
+            max_value=180,
+            value=int(_app_setting("services.price_targets.timeout_seconds", 45)),
+            step=5,
+            key="price_targets_timeout_seconds",
+        )
+        allow_unknown = target_cols[2].checkbox(
+            "Allow unknown symbols",
+            value=bool(_app_setting("services.price_targets.allow_unknown_symbols", False)),
+            key="price_targets_allow_unknown",
+            help="Normally off: only stores symbols already present in Signal Notifier to avoid ticker collisions.",
+        )
+        _save_app_settings(
+            {
+                "services.price_targets.source_url": source_url,
+                "services.price_targets.timeout_seconds": int(timeout_seconds),
+                "services.price_targets.allow_unknown_symbols": bool(allow_unknown),
+            }
+        )
+
+        if st.button("Fetch latest price targets", type="primary", use_container_width=True):
+            started = time.monotonic()
+            service_run_id = database.start_service_run("price_targets", scope=f"source_url={source_url}")
+            try:
+                with st.spinner("Fetching and parsing PriceTargets.com..."):
+                    result = fetch_and_store_price_targets(
+                        database,
+                        source_url=str(source_url),
+                        timeout_seconds=int(timeout_seconds),
+                        allow_unknown_symbols=bool(allow_unknown),
+                    )
+                duration = time.monotonic() - started
+                database.finish_service_run(
+                    service_run_id,
+                    status="success" if result.stored_latest or result.stored_events else "partial",
+                    processed_count=result.fetched,
+                    success_count=result.stored_latest,
+                    skipped_count=result.skipped_unknown,
+                    duration_seconds=duration,
+                    message=(
+                        f"stored_latest={result.stored_latest}, stored_events={result.stored_events}, "
+                        f"skipped_unknown={result.skipped_unknown}"
+                    ),
+                )
+                st.cache_data.clear()
+                st.success(
+                    "Price targets complete: "
+                    f"fetched={result.fetched:,}, stored_latest={result.stored_latest:,}, "
+                    f"events={result.stored_events:,}, skipped_unknown={result.skipped_unknown:,}, "
+                    f"duration={duration:.1f}s"
+                )
+            except Exception as exc:
+                database.finish_service_run(
+                    service_run_id,
+                    status="failed",
+                    error_count=1,
+                    duration_seconds=time.monotonic() - started,
+                    message=str(exc),
+                )
+                st.cache_data.clear()
+                st.error(f"Price targets failed: {exc}")
+
+        recent_targets = pd.DataFrame(database.recent_price_targets(limit=25))
+        if not recent_targets.empty:
+            st.markdown("#### Latest captured target rows")
+            st.dataframe(
+                _display_history_frame(recent_targets),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Target Price": st.column_config.NumberColumn(format="$%.2f"),
+                    "Previous Target Price": st.column_config.NumberColumn(format="$%.2f"),
+                    "Price Then": st.column_config.NumberColumn(format="$%.2f"),
+                    "Source Current Price": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+
     with st.expander("Data ingestion: historical data", expanded=False):
         st.markdown(
             "Backfill daily historical bars for a selected universe, list, or typed tickers. "
@@ -3501,6 +3690,7 @@ if selected_page == "Market data":
                     "Daily change %": st.column_config.NumberColumn(format="%.2f%%"),
                     "Dollar volume": st.column_config.NumberColumn(format="$%.0f"),
                     "Market cap": st.column_config.NumberColumn(format="$%.0f"),
+                    "Price Target": st.column_config.NumberColumn(format="$%.2f"),
                 },
             }
             try:

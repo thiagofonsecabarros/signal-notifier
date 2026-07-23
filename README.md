@@ -233,6 +233,14 @@ Company profile ingestion:
 - estimates the selected run size and API time before running;
 - preserves anything already loaded and logs the run as `company_profiles` in **Latest runs → Service runs**.
 
+Price target ingestion:
+
+- fetches the latest brokerage target rows from PriceTargets.com;
+- stores the latest target per symbol/brokerage plus a deduplicated event history;
+- powers the **Market Data → Price Target** reference column using the average latest target for each stock;
+- powers **Stock details → Brokerage price targets**, including price then, price now, change since target, target upside, and reached status;
+- runs manually or through the Services scheduler and logs as `price_targets` in **Latest runs → Service runs**.
+
 For the full stock universe, market snapshots are fast enough to run frequently. Company profiles are slower because they require one ticker-overview request per symbol; prefer selected lists, safe request pacing, or the all-remaining option as a scheduled/overnight job instead of a huge interactive daytime dashboard run.
 
 Signal scoring:
@@ -284,7 +292,7 @@ The Streamlit dashboard currently includes:
 - **Market data** — Stocks universe/list view selector, searchable symbol/company lookup, range selector, cached symbol history, and aligned no-gap price/volume chart.
 - **Lists** — full-width list workspace with existing-list table, create/manage selector, manual ticker management, and signal-derived list creation.
 - **Signal Builder** — configurable technical-signal definitions stored in SQLite, with inline component help, examples, universe selection by lists/tickers, per-signal scheduler controls, and a Test alert button that refreshes Massive snapshot data and sends/records a compact top-10 Telegram digest.
-- **Services** — bounded maintenance/data-ingestion actions, including market snapshots, chunked historical-data backfills, and chunked company-profile ingestion for the stock universe, selected lists, or typed tickers. Each service also has a persistent scheduler with minute/hour/day/business-day/week frequencies and optional Telegram completion/error notifications.
+- **Services** — bounded maintenance/data-ingestion actions, including market snapshots, price-target ingestion, chunked historical-data backfills, and chunked company-profile ingestion for the stock universe, selected lists, or typed tickers. Each service also has a persistent scheduler with minute/hour/day/business-day/week frequencies and optional Telegram completion/error notifications.
 - **Latest runs** — Telegram notification delivery history, generated alerts, pending alerts, fetch logs, signal-run history, service-run history, and scan-cycle history. Timestamps are displayed in US Eastern time with human-readable column names.
 
 The Signal Builder supports weighted score components and hard gate/filter components. Current component types include:
@@ -334,7 +342,7 @@ The **Market data** tab lets you choose a single view with checkbox-style select
 
 Only one Market Data view is active at a time. The table uses the selected view. The stock lookup at the top searches the full active universe so you can open any ticker without switching views.
 
-Market Data also includes an on-demand stock detail panel. Use the **Stock lookup** search directly under the main navigation to open any active ticker in the database, or select/click a ticker row in the table when supported by your Streamlit version. The detail panel is local-first and shows latest snapshot metrics, profile metadata, list memberships, latest signal scores, component breakdowns, recent alerts, TradingView/Yahoo links, and the symbol chart. The optional **Refresh profile** button makes one Massive ticker-overview call for that symbol; it does not fetch the full market on every click.
+Market Data also includes an on-demand stock detail panel. Use the **Stock lookup** search directly under the main navigation to open any active ticker in the database, or select/click a ticker row in the table when supported by your Streamlit version. The detail panel is local-first and shows latest snapshot metrics, brokerage price targets, profile metadata, list memberships, latest signal scores, component breakdowns, recent alerts, TradingView/Yahoo links, and the symbol chart. The optional **Refresh profile** button makes one Massive ticker-overview call for that symbol; it does not fetch the full market on every click.
 
 When a custom list is selected, Market Data loads only that list's symbols instead of loading the full stock universe first. This keeps list views faster after broad historical backfills.
 
@@ -779,6 +787,7 @@ stock-notifier services-run-due
 stock-notifier services-run-due --service snapshot --force
 stock-notifier services-run-due --service historical --force
 stock-notifier services-run-due --service profiles --force
+stock-notifier services-run-due --service price_targets --force
 stock-notifier services-run-due --signal 1 --force
 stock-notifier services-run-due --test-alert 1
 ```
@@ -951,6 +960,16 @@ Copy changed source files:
 scp -i $KEY -r "$LOCAL\src\stock_notifier" "${SERVER}:${REMOTE}/src/"
 ```
 
+Before running a deployment that changes the SQLite schema, back up the cloud database on the server:
+
+```bash
+cd SERVER_PROJECT_DIR
+mkdir -p backups
+cp DB_FILEPATH backups/stock_notifier_$(date -u +%Y%m%dT%H%M%SZ).db
+```
+
+Do not copy the local SQLite database over the cloud SQLite database during normal updates. The cloud DB contains server-created lists, schedules, runs, alerts, scores, and imported data. `stock-notifier init-db` is the safe migration path; it adds missing tables/columns and preserves existing rows.
+
 If this is the first deployment that includes the service scheduler, create the remote package folder before copying individual scheduler files:
 
 ```bash
@@ -966,6 +985,32 @@ python -m py_compile src/stock_notifier/*.py src/stock_notifier/scoring/*.py src
 stock-notifier init-db
 sudo systemctl restart stock-notifier-dashboard.service
 ```
+
+### Import existing Investment Analysis price targets
+
+Export locally from the Investment Analysis SQLite database to a CSV that contains only price-target rows:
+
+```powershell
+stock-notifier export-price-targets --source-db IA_DB_FILEPATH --output PRICE_TARGET_EXPORT_FILEPATH
+```
+
+Copy only that CSV to the Oracle server:
+
+```powershell
+scp -i $KEY PRICE_TARGET_EXPORT_FILEPATH "${SERVER}:${REMOTE}/data/price_targets_export.csv"
+```
+
+Then import it on the server:
+
+```bash
+cd SERVER_PROJECT_DIR
+source .venv/bin/activate
+stock-notifier init-db
+stock-notifier import-price-targets --input SERVER_PRICE_TARGET_EXPORT_FILEPATH
+sudo systemctl restart stock-notifier-dashboard.service
+```
+
+By default, the import skips symbols that are not already in Signal Notifier's stock universe. Use `--allow-unknown-symbols` only if you intentionally want the import to create missing symbols.
 
 Install updated systemd service/timer files only when the files under `deploy/` changed, or when enabling a timer for the first time. Normal dashboard schedule edits do not need systemd commands.
 
@@ -989,6 +1034,8 @@ Current SQLite schema includes:
 - `daily_bars`
 - `market_snapshots`
 - `market_snapshot_history`
+- `price_targets_latest`
+- `price_target_events`
 - `fetch_log`
 - `signal_definitions`
 - `signal_runs`

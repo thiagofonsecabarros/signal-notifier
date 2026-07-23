@@ -63,3 +63,20 @@ class CompanyProfile:
     list_date: str = ""
     logo_url: str = ""
     icon_url: str = ""
+
+
+@dataclass(frozen=True)
+class PriceTarget:
+    symbol: str
+    brokerage: str
+    target_price: float | None
+    company_name: str = ""
+    action: str = ""
+    rating: str = ""
+    previous_target_price: float | None = None
+    price_then: float | None = None
+    source_current_price: float | None = None
+    effective_date: str = ""
+    source_url: str = ""
+    captured_at: str = ""
+    raw_payload_json: str = "{}"

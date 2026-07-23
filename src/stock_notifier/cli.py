@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 from datetime import date, timedelta
+from pathlib import Path
 
 from stock_notifier.config import Settings
 from stock_notifier.db import Database
@@ -16,6 +17,11 @@ from stock_notifier.notifications.service import (
 from stock_notifier.pipeline import run_scan_cycle, scan_cycle_lock
 from stock_notifier.providers.massive import MassiveClient
 from stock_notifier.scoring.service import score_enabled_signals, score_signal, seed_starter_signals
+from stock_notifier.services.price_targets import (
+    export_investment_analysis_price_targets,
+    fetch_and_store_price_targets,
+    import_price_targets_csv,
+)
 from stock_notifier.services.scheduler import SERVICE_KEYS, run_due_services, run_due_signals, run_signal_test_alert
 from stock_notifier.symbols import load_symbols
 
@@ -42,6 +48,25 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         help="Override profile-sync request rate. Defaults to MASSIVE_PROFILE_REQUESTS_PER_MINUTE.",
     )
+
+    price_targets = subparsers.add_parser("fetch-price-targets", help="Fetch latest PriceTargets.com rows")
+    price_targets.add_argument("--source-url", default="https://www.pricetargets.com/")
+    price_targets.add_argument("--timeout-seconds", type=int, default=45)
+    price_targets.add_argument("--allow-unknown-symbols", action="store_true")
+
+    export_targets = subparsers.add_parser(
+        "export-price-targets",
+        help="Export Investment Analysis price-target rows to a CSV for safe cloud import",
+    )
+    export_targets.add_argument("--source-db", required=True, help="Investment Analysis SQLite db_filepath")
+    export_targets.add_argument("--output", required=True, help="CSV output filepath")
+
+    import_targets = subparsers.add_parser(
+        "import-price-targets",
+        help="Import price-target CSV rows into the current Signal Notifier DB",
+    )
+    import_targets.add_argument("--input", required=True, help="CSV input filepath")
+    import_targets.add_argument("--allow-unknown-symbols", action="store_true")
 
     daily = subparsers.add_parser("fetch-daily", help="Fetch the most recent grouped daily bars")
     daily.add_argument("--date", type=date.fromisoformat, default=date.today())
@@ -123,7 +148,6 @@ def main() -> None:
         "run-scan-cycle",
         "sync-profiles",
         "sync-reference-tickers",
-        "services-run-due",
     }
     settings = Settings.from_env(require_api_key=require_api_key)
     logging.basicConfig(
@@ -180,6 +204,50 @@ def main() -> None:
         )
         if errors:
             raise SystemExit(2)
+    elif args.command == "fetch-price-targets":
+        result = fetch_and_store_price_targets(
+            database,
+            source_url=args.source_url,
+            timeout_seconds=args.timeout_seconds,
+            allow_unknown_symbols=args.allow_unknown_symbols,
+        )
+        print(
+            "Price targets complete: "
+            f"fetched={result.fetched}, stored_latest={result.stored_latest}, "
+            f"events={result.stored_events}, skipped_unknown={result.skipped_unknown}"
+        )
+    elif args.command == "export-price-targets":
+        count = export_investment_analysis_price_targets(Path(args.source_db), Path(args.output))
+        print(f"Exported {count} price-target rows to {args.output}")
+    elif args.command == "import-price-targets":
+        service_run_id = database.start_service_run("price_targets_import", scope=str(args.input))
+        try:
+            result = import_price_targets_csv(
+                database,
+                Path(args.input),
+                allow_unknown_symbols=args.allow_unknown_symbols,
+            )
+            database.finish_service_run(
+                service_run_id,
+                status="success",
+                processed_count=int(result["latest_rows"]) + int(result["event_rows"]),
+                success_count=int(result["latest_stored"]),
+                skipped_count=int(result["skipped_unknown"]),
+                duration_seconds=0,
+                message=(
+                    f"latest_rows={result['latest_rows']}, event_rows={result['event_rows']}, "
+                    f"events_inserted={result['events_inserted']}, skipped_unknown={result['skipped_unknown']}"
+                ),
+            )
+            print(
+                "Imported price targets: "
+                f"latest_rows={result['latest_rows']}, event_rows={result['event_rows']}, "
+                f"latest_stored={result['latest_stored']}, events_inserted={result['events_inserted']}, "
+                f"skipped_unknown={result['skipped_unknown']}"
+            )
+        except Exception as exc:
+            database.finish_service_run(service_run_id, status="failed", error_count=1, message=str(exc))
+            raise
     elif args.command == "fetch-daily":
         actual_date, count = fetch_grouped_with_lookback(
             database,

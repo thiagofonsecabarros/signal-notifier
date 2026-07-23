@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot, Symbol
+from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot, PriceTarget, Symbol
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS symbols (
@@ -277,6 +277,50 @@ ON market_snapshot_history(symbol, snapshot_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_market_snapshot_history_fetched
 ON market_snapshot_history(fetched_at DESC);
+
+CREATE TABLE IF NOT EXISTS price_targets_latest (
+    symbol TEXT NOT NULL REFERENCES symbols(ticker),
+    brokerage TEXT NOT NULL,
+    company_name TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    rating TEXT NOT NULL DEFAULT '',
+    target_price REAL,
+    previous_target_price REAL,
+    price_then REAL,
+    source_current_price REAL,
+    effective_date TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    raw_payload_json TEXT NOT NULL DEFAULT '{}',
+    captured_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, brokerage)
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_targets_latest_symbol
+ON price_targets_latest(symbol, target_price);
+
+CREATE TABLE IF NOT EXISTS price_target_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    symbol TEXT NOT NULL REFERENCES symbols(ticker),
+    brokerage TEXT NOT NULL,
+    company_name TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    rating TEXT NOT NULL DEFAULT '',
+    previous_target_price REAL,
+    target_price REAL,
+    price_then REAL,
+    source_current_price REAL,
+    effective_date TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    import_source TEXT NOT NULL DEFAULT '',
+    raw_payload_json TEXT NOT NULL DEFAULT '{}',
+    captured_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_target_events_symbol_date
+ON price_target_events(symbol, effective_date DESC, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS scan_cycle_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -689,6 +733,223 @@ class Database:
             "latest_snapshot_at": None,
             "latest_fetched_at": None,
         }
+
+    def upsert_price_targets(
+        self,
+        targets: Iterable[PriceTarget],
+        *,
+        import_source: str = "",
+        update_latest: bool = True,
+    ) -> tuple[int, int]:
+        now = datetime.now(UTC).isoformat()
+        latest_rows: list[tuple[Any, ...]] = []
+        event_rows: list[tuple[Any, ...]] = []
+        for target in targets:
+            symbol = str(target.symbol or "").upper().strip()
+            brokerage = str(target.brokerage or "").strip()
+            if not symbol or not brokerage:
+                continue
+            captured_at = str(target.captured_at or "").strip() or now
+            effective_date = str(target.effective_date or "").strip()[:10]
+            source_url = str(target.source_url or "").strip()
+            raw_json = str(target.raw_payload_json or "{}")
+            latest_rows.append(
+                (
+                    symbol,
+                    brokerage,
+                    str(target.company_name or "").strip(),
+                    str(target.action or "").strip(),
+                    str(target.rating or "").strip(),
+                    target.target_price,
+                    target.previous_target_price,
+                    target.price_then,
+                    target.source_current_price,
+                    effective_date,
+                    source_url,
+                    raw_json,
+                    captured_at,
+                    now,
+                )
+            )
+            event_key = "|".join(
+                [
+                    symbol,
+                    brokerage.lower(),
+                    effective_date,
+                    str(target.action or "").strip().lower(),
+                    str(target.rating or "").strip().lower(),
+                    "" if target.previous_target_price is None else f"{float(target.previous_target_price):.8f}",
+                    "" if target.target_price is None else f"{float(target.target_price):.8f}",
+                    captured_at[:19],
+                ]
+            )
+            event_rows.append(
+                (
+                    event_key,
+                    symbol,
+                    brokerage,
+                    str(target.company_name or "").strip(),
+                    str(target.action or "").strip(),
+                    str(target.rating or "").strip(),
+                    target.previous_target_price,
+                    target.target_price,
+                    target.price_then,
+                    target.source_current_price,
+                    effective_date,
+                    source_url,
+                    import_source,
+                    raw_json,
+                    captured_at,
+                    now,
+                )
+            )
+        if not latest_rows:
+            return 0, 0
+        with self.connect() as connection:
+            if update_latest:
+                connection.executemany(
+                    """
+                    INSERT INTO price_targets_latest(
+                        symbol, brokerage, company_name, action, rating, target_price,
+                        previous_target_price, price_then, source_current_price,
+                        effective_date, source_url, raw_payload_json, captured_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, brokerage) DO UPDATE SET
+                        company_name=excluded.company_name,
+                        action=excluded.action,
+                        rating=excluded.rating,
+                        target_price=excluded.target_price,
+                        previous_target_price=excluded.previous_target_price,
+                        price_then=excluded.price_then,
+                        source_current_price=excluded.source_current_price,
+                        effective_date=excluded.effective_date,
+                        source_url=excluded.source_url,
+                        raw_payload_json=excluded.raw_payload_json,
+                        captured_at=excluded.captured_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    latest_rows,
+                )
+            cursor = connection.executemany(
+                """
+                INSERT OR IGNORE INTO price_target_events(
+                    event_key, symbol, brokerage, company_name, action, rating,
+                    previous_target_price, target_price, price_then, source_current_price,
+                    effective_date, source_url, import_source, raw_payload_json,
+                    captured_at, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                event_rows,
+            )
+            inserted_events = int(cursor.rowcount or 0)
+        return (len(latest_rows) if update_latest else 0), inserted_events
+
+    def price_target_service_status(self) -> dict[str, Any]:
+        rows = self.query(
+            """
+            SELECT COUNT(*) AS latest_count,
+                   COUNT(DISTINCT symbol) AS symbol_count,
+                   MAX(captured_at) AS latest_captured_at,
+                   MAX(effective_date) AS latest_effective_date
+            FROM price_targets_latest
+            """
+        )
+        return dict(rows[0]) if rows else {
+            "latest_count": 0,
+            "symbol_count": 0,
+            "latest_captured_at": None,
+            "latest_effective_date": None,
+        }
+
+    def recent_price_targets(self, limit: int = 25) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT symbol, brokerage, company_name, action, rating, target_price,
+                   previous_target_price, price_then, source_current_price,
+                   effective_date, captured_at
+            FROM price_target_events
+            ORDER BY captured_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+    def price_target_averages(self) -> dict[str, float]:
+        rows = self.query(
+            """
+            SELECT symbol, AVG(target_price) AS average_target
+            FROM price_targets_latest
+            WHERE target_price IS NOT NULL AND target_price > 0
+            GROUP BY symbol
+            """
+        )
+        return {str(row["symbol"]): float(row["average_target"]) for row in rows if row["average_target"] is not None}
+
+    def price_targets_for_symbol(self, symbol: str) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT
+                p.symbol,
+                p.brokerage,
+                p.company_name,
+                p.action,
+                p.rating,
+                p.target_price,
+                p.previous_target_price,
+                COALESCE(p.price_then, p.source_current_price, then_bar.close) AS price_then,
+                p.source_current_price,
+                p.effective_date,
+                p.source_url,
+                p.captured_at,
+                COALESCE(m.price, latest_bar.close) AS price_now,
+                latest_bar.trading_date AS latest_trading_date,
+                reached.reached_date
+            FROM price_targets_latest p
+            LEFT JOIN market_snapshots m ON m.symbol=p.symbol
+            LEFT JOIN (
+                SELECT b.symbol, b.trading_date, b.close
+                FROM daily_bars b
+                JOIN (
+                    SELECT symbol, MAX(trading_date) AS trading_date
+                    FROM daily_bars
+                    GROUP BY symbol
+                ) x ON x.symbol=b.symbol AND x.trading_date=b.trading_date
+            ) latest_bar ON latest_bar.symbol=p.symbol
+            LEFT JOIN daily_bars then_bar
+              ON then_bar.symbol=p.symbol
+             AND then_bar.trading_date = (
+                SELECT MAX(b2.trading_date)
+                FROM daily_bars b2
+                WHERE b2.symbol=p.symbol
+                  AND p.effective_date <> ''
+                  AND b2.trading_date <= p.effective_date
+             )
+            LEFT JOIN (
+                SELECT
+                    p2.symbol,
+                    p2.brokerage,
+                    MIN(b.trading_date) AS reached_date
+                FROM price_targets_latest p2
+                JOIN daily_bars b ON b.symbol=p2.symbol
+                WHERE p2.target_price IS NOT NULL
+                  AND p2.effective_date <> ''
+                  AND b.trading_date >= p2.effective_date
+                  AND (
+                    (COALESCE(p2.price_then, p2.source_current_price, 0) <= p2.target_price AND b.high >= p2.target_price)
+                    OR
+                    (COALESCE(p2.price_then, p2.source_current_price, 0) > p2.target_price AND b.low <= p2.target_price)
+                  )
+                GROUP BY p2.symbol, p2.brokerage
+            ) reached ON reached.symbol=p.symbol AND reached.brokerage=p.brokerage
+            WHERE p.symbol=?
+            ORDER BY p.effective_date DESC, p.brokerage ASC
+            """,
+            (symbol.upper().strip(),),
+        )
+        return [dict(row) for row in rows]
 
     def upsert_company_profile(self, profile: CompanyProfile) -> None:
         now = datetime.now(UTC).isoformat()
