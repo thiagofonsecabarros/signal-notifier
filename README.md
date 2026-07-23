@@ -306,6 +306,7 @@ The Signal Builder supports weighted score components and hard gate/filter compo
 - latest volume
 - dollar volume
 - price change %
+- price target
 
 Starter signal templates:
 
@@ -446,6 +447,10 @@ Score: Volume ratio            → ranks unusual volume higher
 | Slow period | For crossover components only. The main Period is the fast average; Slow period is the slower comparison average. |
 | Score min | Raw value that maps near 0 points for a score component. |
 | Score max | Raw value that maps near 100 points for a score component. |
+| Target metric | For Price Target components, choose whether the component uses overall target strength, unreached target count, average expected upside %, or recency score. |
+| Max target count | For Price Target overall score, number of unreached targets that maps the count sub-score to 100. |
+| Max upside % | For Price Target overall score, expected upside that maps the upside sub-score to 100. |
+| Recency half-life days | For Price Target overall score, recent targets receive more credit; one half-life cuts the recency sub-score in half. |
 
 ### Component types
 
@@ -460,6 +465,7 @@ Score: Volume ratio            → ranks unusual volume higher
 | Latest volume | Latest volume. In scan cycles this is current day volume from the latest snapshot. | Raw liquidity filter. |
 | Dollar volume | Latest close multiplied by latest volume. | Price-adjusted liquidity filter. |
 | Price change % | Percent price change over N daily bars. | Momentum ranking. |
+| Price target | Stored brokerage target context. Default raw value is a 0–100 composite of unreached target count, expected upside from current price, and recency. | Brokerage-support gate or score. |
 
 ### Useful component recipes
 
@@ -569,6 +575,39 @@ Weight: 1
 ```
 
 This filters out illiquid symbols, then ranks the remaining symbols by strongest 1-day price change. For a 5-day momentum version, set `Change days` to `5`.
+
+Price-target support score:
+
+```text
+Type: Price target
+Mode: score
+Target metric: Overall target score
+Op: >=
+Threshold: 0
+Score min: 0
+Score max: 100
+Weight: 1
+Max target count: 5
+Max upside %: 25
+Recency half-life days: 90
+Target-count blend weight: 0.4
+Upside blend weight: 0.4
+Recency blend weight: 0.2
+```
+
+This ranks stocks higher when they have more unreached bullish brokerage targets, higher average expected upside from the current price, and more recent target updates. Expected upside uses the current price. For example, if a target was set at `$200` when the stock was `$100`, but the stock is now `$190`, the expected upside is about `5.26%`, not `100%`.
+
+Price-target gate requiring analyst support:
+
+```text
+Type: Price target
+Mode: gate
+Target metric: Unreached count
+Op: >=
+Threshold: 3
+```
+
+This keeps only stocks with at least three unreached bullish brokerage targets above the current price.
 
 ### Example signals
 

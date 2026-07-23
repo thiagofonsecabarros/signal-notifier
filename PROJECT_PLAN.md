@@ -13,6 +13,7 @@ The Signal Notifier application now has the main US-focused MVP pieces implement
 - SQLite storage for symbols, lists, company profiles, daily bars, latest snapshots, short intraday snapshot history, brokerage price targets, signals, scores, alerts, notification deliveries, service runs, app settings, and scan-cycle runs.
 - Massive reference-ticker sync for active US stock universe metadata, plus full-market snapshot ingestion that refreshes tradable snapshot symbols without letting liquidity filters shrink the master universe.
 - Configurable Signal Builder with score components, gate/filter components, preview rankings, saved signal definitions, and signal-derived list creation.
+- Signal Builder includes a Price Target component that can gate/score stocks using unreached brokerage target count, expected upside from current price, and target recency.
 - Market Data view switching between the full stock universe and custom lists; custom list views load only the selected list's symbols.
 - Telegram notification engine with dry-run mode, Signal Builder test alerts, scheduled signal/service delivery, pending alerts, delivery history, and full scan-cycle integration.
 - E2-safe 15-minute scan-cycle pipeline:

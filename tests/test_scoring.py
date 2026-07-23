@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import pandas as pd
 
 from stock_notifier.db import Database
-from stock_notifier.models import DailyBar, Symbol
+from stock_notifier.models import DailyBar, PriceTarget, Symbol
 from stock_notifier.scoring.engine import SignalDefinition, evaluate_signal
 from stock_notifier.scoring.indicators import price_change_pct, sma, volume_ratio
 from stock_notifier.scoring.service import score_enabled_signals_grouped, score_signal, seed_starter_signals
@@ -132,6 +132,123 @@ def test_signal_engine_supports_dollar_volume_gate_with_price_change_score():
     assert result.components[0].score == 0
     assert result.components[0].weight == 0
     assert result.components[0].contribution == 0
+    assert result.score > 0
+
+
+def test_signal_engine_scores_price_target_expected_upside_from_current_price():
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "trading_date": "2026-07-01",
+                "open": 95,
+                "high": 101,
+                "low": 94,
+                "close": 100,
+                "volume": 1_000,
+            },
+            {
+                "symbol": "AAPL",
+                "trading_date": "2026-07-02",
+                "open": 180,
+                "high": 191,
+                "low": 179,
+                "close": 190,
+                "volume": 1_000,
+            },
+        ]
+    )
+    definition = SignalDefinition(
+        "Target Upside",
+        {
+            "components": [
+                {
+                    "name": "Average target upside",
+                    "type": "price_target",
+                    "mode": "score",
+                    "weight": 1,
+                    "score_min": 0,
+                    "score_max": 10,
+                    "params": {"metric": "avg_upside_pct"},
+                }
+            ]
+        },
+    )
+
+    result = evaluate_signal(
+        definition,
+        {"AAPL": frame},
+        {
+            "AAPL": [
+                {
+                    "target_price": 200,
+                    "price_then": 100,
+                    "effective_date": "2026-07-01",
+                    "captured_at": "2026-07-01T20:00:00+00:00",
+                    "reached_date": "",
+                }
+            ]
+        },
+    )[0]
+
+    assert round(result.components[0].value or 0, 2) == 5.26
+    assert 50 < result.score < 60
+
+
+def test_signal_engine_price_target_gate_can_require_unreached_count():
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "trading_date": "2026-07-02",
+                "open": 180,
+                "high": 191,
+                "low": 179,
+                "close": 190,
+                "volume": 1_000,
+            }
+        ]
+    )
+    definition = SignalDefinition(
+        "Target Count Gate",
+        {
+            "components": [
+                {
+                    "name": "At least two unreached targets",
+                    "type": "price_target",
+                    "mode": "gate",
+                    "operator": ">=",
+                    "threshold": 2,
+                    "params": {"metric": "unreached_count"},
+                },
+                {
+                    "name": "Overall target strength",
+                    "type": "price_target",
+                    "mode": "score",
+                    "weight": 1,
+                    "score_min": 0,
+                    "score_max": 100,
+                    "params": {"metric": "target_score"},
+                },
+            ]
+        },
+    )
+
+    result = evaluate_signal(
+        definition,
+        {"AAPL": frame},
+        {
+            "AAPL": [
+                {"target_price": 200, "effective_date": "2026-07-01", "captured_at": "2026-07-01T20:00:00+00:00"},
+                {"target_price": 210, "effective_date": "2026-07-01", "captured_at": "2026-07-01T20:00:00+00:00"},
+                {"target_price": 180, "effective_date": "2026-07-01", "captured_at": "2026-07-01T20:00:00+00:00"},
+            ]
+        },
+    )[0]
+
+    assert result.eligible is True
+    assert result.components[0].value == 2
+    assert result.components[0].score == 0
     assert result.score > 0
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import pandas as pd
@@ -147,13 +148,112 @@ def _indicator_value(frame: pd.DataFrame, component: dict[str, Any]) -> tuple[fl
     raise ValueError(f"Unsupported component type: {component_type}")
 
 
-def _component_result(frame: pd.DataFrame, component: dict[str, Any]) -> ComponentResult:
+def _parse_date(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        if len(text) <= 10:
+            return datetime.fromisoformat(text[:10]).replace(tzinfo=UTC)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def _price_target_metric(
+    frame: pd.DataFrame,
+    component: dict[str, Any],
+    targets: list[dict[str, Any]],
+) -> tuple[float | None, str]:
+    params = dict(component.get("params") or {})
+    metric = str(params.get("metric") or "target_score")
+    index = len(frame) - 1
+    if frame.empty or index < 0:
+        return None, "Price targets: no price history"
+    current_price = _as_float(frame["close"].iloc[index])
+    if current_price in (None, 0):
+        return None, "Price targets: no current price"
+
+    max_targets_for_score = max(_as_float(params.get("max_targets_for_score")) or 5.0, 1.0)
+    max_upside_pct_for_score = max(_as_float(params.get("max_upside_pct_for_score")) or 25.0, 0.01)
+    half_life_days = max(_as_float(params.get("recency_half_life_days")) or 90.0, 1.0)
+    count_weight = max(_as_float(params.get("count_weight")) or 0.4, 0.0)
+    upside_weight = max(_as_float(params.get("upside_weight")) or 0.4, 0.0)
+    recency_weight = max(_as_float(params.get("recency_weight")) or 0.2, 0.0)
+    weight_total = count_weight + upside_weight + recency_weight
+    if weight_total <= 0:
+        count_weight, upside_weight, recency_weight, weight_total = 0.4, 0.4, 0.2, 1.0
+
+    now_dt = datetime.now(UTC)
+    valid: list[dict[str, float]] = []
+    for row in targets:
+        target_price = _as_float(row.get("target_price"))
+        if target_price is None or target_price <= current_price:
+            continue
+        if str(row.get("reached_date") or "").strip():
+            continue
+        upside_pct = (target_price - current_price) / current_price * 100.0
+        reference_date = _parse_date(row.get("effective_date")) or _parse_date(row.get("captured_at"))
+        age_days = max((now_dt - reference_date).days, 0) if reference_date else half_life_days
+        recency_score = 100.0 * (0.5 ** (age_days / half_life_days))
+        valid.append({"upside_pct": upside_pct, "recency_score": recency_score})
+
+    unreached_count = float(len(valid))
+    avg_upside_pct = (
+        sum(item["upside_pct"] for item in valid) / len(valid)
+        if valid
+        else 0.0
+    )
+    avg_recency_score = (
+        sum(item["recency_score"] for item in valid) / len(valid)
+        if valid
+        else 0.0
+    )
+    count_score = min(unreached_count / max_targets_for_score, 1.0) * 100.0
+    upside_score = min(max(avg_upside_pct, 0.0) / max_upside_pct_for_score, 1.0) * 100.0
+    target_score = (
+        count_score * count_weight
+        + upside_score * upside_weight
+        + avg_recency_score * recency_weight
+    ) / weight_total
+
+    metric_values = {
+        "target_score": target_score,
+        "unreached_count": unreached_count,
+        "avg_upside_pct": avg_upside_pct,
+        "recency_score": avg_recency_score,
+    }
+    value = metric_values.get(metric, target_score)
+    label = (
+        "Price target strength"
+        if metric == "target_score"
+        else "Unreached price targets"
+        if metric == "unreached_count"
+        else "Average price-target upside %"
+        if metric == "avg_upside_pct"
+        else "Price-target recency score"
+    )
+    return value, (
+        f"{label} (unreached={int(unreached_count)}, "
+        f"avg upside={avg_upside_pct:.2f}%, recency={avg_recency_score:.1f})"
+    )
+
+
+def _component_result(
+    frame: pd.DataFrame,
+    component: dict[str, Any],
+    targets: list[dict[str, Any]] | None = None,
+) -> ComponentResult:
     component_type = str(component.get("type") or "").strip()
     mode = str(component.get("mode") or "score").strip().lower()
     if mode not in {"score", "gate"}:
         raise ValueError(f"Unsupported component mode: {mode}")
     name = str(component.get("name") or component_type or "Component")
-    value, label = _indicator_value(frame, component)
+    if component_type == "price_target":
+        value, label = _price_target_metric(frame, component, targets or [])
+    else:
+        value, label = _indicator_value(frame, component)
 
     operator = str(component.get("operator") or ">=").strip()
     threshold = _as_float(component.get("threshold"))
@@ -205,6 +305,7 @@ def _component_result(frame: pd.DataFrame, component: dict[str, Any]) -> Compone
 def evaluate_signal(
     definition: SignalDefinition,
     history_by_symbol: dict[str, pd.DataFrame],
+    price_targets_by_symbol: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[ScoredSymbol]:
     config = dict(definition.config or {})
     components = list(config.get("components") or [])
@@ -214,7 +315,8 @@ def evaluate_signal(
     results: list[ScoredSymbol] = []
     for symbol, frame in sorted(history_by_symbol.items()):
         prepared = frame.sort_values("trading_date").reset_index(drop=True).copy()
-        component_results = [_component_result(prepared, component) for component in components]
+        symbol_targets = (price_targets_by_symbol or {}).get(symbol, [])
+        component_results = [_component_result(prepared, component, symbol_targets) for component in components]
         failed_gates = [
             component for component in component_results if component.mode == "gate" and not component.passed
         ]

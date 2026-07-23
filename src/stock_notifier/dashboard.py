@@ -1546,6 +1546,7 @@ COMPONENT_LABELS = {
     "latest_volume": "Latest volume",
     "dollar_volume": "Dollar volume",
     "price_change_pct": "Price change %",
+    "price_target": "Price target",
 }
 
 COMPONENT_HELP = {
@@ -1558,6 +1559,7 @@ COMPONENT_HELP = {
     "latest_volume": "Value is the latest volume. In scan cycles, this is the current day volume from the latest snapshot.",
     "dollar_volume": "Value is latest close multiplied by latest volume. This is usually the best liquidity filter because it adjusts for stock price.",
     "price_change_pct": "Value is percent price change over the selected number of daily bars. Example: 5 means +5%.",
+    "price_target": "Uses stored brokerage price targets. Default value is a 0–100 composite based on unreached target count, average upside from current price, and recency.",
 }
 
 COMPONENT_EXAMPLES = {
@@ -1570,6 +1572,7 @@ COMPONENT_EXAMPLES = {
     "latest_volume": "Gate: At least 100k shares → Op >=, threshold 100000.",
     "dollar_volume": "Gate: At least $100k traded → Op >=, threshold 100000. Example: price $10 and volume 10,000 = $100,000.",
     "price_change_pct": "Score: 5-day momentum → period 5, score min 0, score max 8. Gate: require positive change → Op >=, threshold 0.",
+    "price_target": "Score: target strength → metric Overall, score min 0, score max 100. Gate: require at least 3 unreached targets → metric Unreached count, Op >=, threshold 3.",
 }
 
 COMPONENTS_WITH_PERIOD = {
@@ -1592,6 +1595,19 @@ COMPONENT_DEFAULTS = {
     "latest_volume": {"threshold": 100_000.0, "period": 1, "score_min": 100_000.0, "score_max": 2_000_000.0},
     "dollar_volume": {"threshold": 100_000.0, "period": 1, "score_min": 100_000.0, "score_max": 5_000_000.0},
     "price_change_pct": {"threshold": 0.0, "period": 5, "score_min": 0.0, "score_max": 8.0},
+    "price_target": {
+        "threshold": 0.0,
+        "period": 1,
+        "score_min": 0.0,
+        "score_max": 100.0,
+        "metric": "target_score",
+        "max_targets_for_score": 5.0,
+        "max_upside_pct_for_score": 25.0,
+        "recency_half_life_days": 90.0,
+        "count_weight": 0.4,
+        "upside_weight": 0.4,
+        "recency_weight": 0.2,
+    },
 }
 
 
@@ -1640,6 +1656,7 @@ def _component_from_inputs(index: int, default_component: dict[str, object] | No
             "latest_volume",
             "dollar_volume",
             "price_change_pct",
+            "price_target",
         ]
         default_type = str(default_component.get("type") or "price_vs_sma")
         component_type = st.selectbox(
@@ -1687,7 +1704,57 @@ def _component_from_inputs(index: int, default_component: dict[str, object] | No
 
     parameter_columns = st.columns([1, 1, 1, 1, 2])
     period = int(default_params.get("period") or default_params.get("days") or default_params.get("fast_period") or defaults.get("period", 20))
-    if component_type in COMPONENTS_WITH_PERIOD:
+    if component_type == "price_target":
+        metric_options = ["target_score", "unreached_count", "avg_upside_pct", "recency_score"]
+        metric_labels = {
+            "target_score": "Overall target score",
+            "unreached_count": "Unreached count",
+            "avg_upside_pct": "Avg expected upside %",
+            "recency_score": "Recency score",
+        }
+        default_metric = str(default_params.get("metric") or defaults.get("metric", "target_score"))
+        with parameter_columns[0]:
+            target_metric = st.selectbox(
+                "Target metric",
+                metric_options,
+                index=metric_options.index(default_metric) if default_metric in metric_options else 0,
+                key=f"component_target_metric_{index}",
+                format_func=lambda value: metric_labels.get(value, value),
+                help="The raw value used for the gate/score. Overall blends count, upside, and recency.",
+            )
+        with parameter_columns[1]:
+            max_targets_for_score = st.number_input(
+                "Max target count",
+                min_value=1.0,
+                value=float(default_params.get("max_targets_for_score") or defaults.get("max_targets_for_score", 5.0)),
+                step=1.0,
+                key=f"component_target_max_count_{index}",
+                help="Number of unreached targets that maps the count sub-score to 100.",
+            )
+        with parameter_columns[2]:
+            max_upside_pct_for_score = st.number_input(
+                "Max upside %",
+                min_value=0.1,
+                value=float(default_params.get("max_upside_pct_for_score") or defaults.get("max_upside_pct_for_score", 25.0)),
+                step=1.0,
+                key=f"component_target_max_upside_{index}",
+                help="Average expected upside that maps the upside sub-score to 100.",
+            )
+        with parameter_columns[3]:
+            recency_half_life_days = st.number_input(
+                "Recency half-life days",
+                min_value=1.0,
+                value=float(default_params.get("recency_half_life_days") or defaults.get("recency_half_life_days", 90.0)),
+                step=15.0,
+                key=f"component_target_half_life_{index}",
+                help="Recent targets matter more. A 90-day half-life means a 90-day-old target has half the recency score.",
+            )
+        with parameter_columns[4]:
+            st.caption(
+                "Only unreached bullish targets above the current price are counted. "
+                "Expected upside is based on current price, not the price when the target was issued."
+            )
+    elif component_type in COMPONENTS_WITH_PERIOD:
         period_label = "Lookback days"
         if component_type in {"sma_crossover", "ema_crossover"}:
             period_label = "Fast period"
@@ -1748,13 +1815,55 @@ def _component_from_inputs(index: int, default_component: dict[str, object] | No
         with parameter_columns[2]:
             st.caption("Gate mode ignores weight and score min/max.")
 
+    target_blend_params: dict[str, float | str] = {}
+    if component_type == "price_target":
+        blend_columns = st.columns(3)
+        with blend_columns[0]:
+            count_weight = st.number_input(
+                "Target-count blend weight",
+                min_value=0.0,
+                value=float(default_params.get("count_weight") or defaults.get("count_weight", 0.4)),
+                step=0.1,
+                key=f"component_target_count_weight_{index}",
+                help="How much the number of unreached targets matters inside the overall target score.",
+            )
+        with blend_columns[1]:
+            upside_weight = st.number_input(
+                "Upside blend weight",
+                min_value=0.0,
+                value=float(default_params.get("upside_weight") or defaults.get("upside_weight", 0.4)),
+                step=0.1,
+                key=f"component_target_upside_weight_{index}",
+                help="How much average expected upside matters inside the overall target score.",
+            )
+        with blend_columns[2]:
+            recency_weight = st.number_input(
+                "Recency blend weight",
+                min_value=0.0,
+                value=float(default_params.get("recency_weight") or defaults.get("recency_weight", 0.2)),
+                step=0.1,
+                key=f"component_target_recency_weight_{index}",
+                help="How much recent target issuance matters inside the overall target score.",
+            )
+        target_blend_params = {
+            "metric": target_metric,
+            "max_targets_for_score": float(max_targets_for_score),
+            "max_upside_pct_for_score": float(max_upside_pct_for_score),
+            "recency_half_life_days": float(recency_half_life_days),
+            "count_weight": float(count_weight),
+            "upside_weight": float(upside_weight),
+            "recency_weight": float(recency_weight),
+        }
+
     help_columns = st.columns([1])
     with help_columns[0]:
         st.caption(f"**Meaning:** {COMPONENT_HELP.get(component_type, '')}")
         st.caption(f"**Example:** {COMPONENT_EXAMPLES.get(component_type, '')}")
 
     params: dict[str, object]
-    if component_type in {"sma_crossover", "ema_crossover"}:
+    if component_type == "price_target":
+        params = target_blend_params
+    elif component_type in {"sma_crossover", "ema_crossover"}:
         params = {"fast_period": int(period), "slow_period": int(slow)}
     elif component_type == "price_change_pct":
         params = {"days": int(period)}
@@ -1850,6 +1959,28 @@ def _load_signal_builder_form_state(selected_row: dict[str, object] | None) -> N
         st.session_state[f"component_score_max_{index}"] = float(
             component.get("score_max", defaults.get("score_max", 10.0))
         )
+        if component_type == "price_target":
+            st.session_state[f"component_target_metric_{index}"] = str(
+                params.get("metric") or defaults.get("metric", "target_score")
+            )
+            st.session_state[f"component_target_max_count_{index}"] = float(
+                params.get("max_targets_for_score") or defaults.get("max_targets_for_score", 5.0)
+            )
+            st.session_state[f"component_target_max_upside_{index}"] = float(
+                params.get("max_upside_pct_for_score") or defaults.get("max_upside_pct_for_score", 25.0)
+            )
+            st.session_state[f"component_target_half_life_{index}"] = float(
+                params.get("recency_half_life_days") or defaults.get("recency_half_life_days", 90.0)
+            )
+            st.session_state[f"component_target_count_weight_{index}"] = float(
+                params.get("count_weight") or defaults.get("count_weight", 0.4)
+            )
+            st.session_state[f"component_target_upside_weight_{index}"] = float(
+                params.get("upside_weight") or defaults.get("upside_weight", 0.4)
+            )
+            st.session_state[f"component_target_recency_weight_{index}"] = float(
+                params.get("recency_weight") or defaults.get("recency_weight", 0.2)
+            )
 
 
 def _signal_preview_symbols(config: dict[str, object]) -> set[str]:
@@ -2007,6 +2138,11 @@ def _preview_signal_with_progress(preview_row: dict[str, object]) -> tuple[list[
 
     progress.progress(0.55, text=f"Loaded history for {len(history):,} symbols; building frames...")
     frames = _history_frames_for_preview(history)
+    uses_price_targets = any(
+        str(dict(component or {}).get("type") or "").strip() == "price_target"
+        for component in list(config.get("components") or [])
+    )
+    price_targets = database.price_targets_for_symbols(frames.keys()) if uses_price_targets else {}
     definition = SignalDefinition(
         name=str(preview_row["name"]),
         config=config,
@@ -2016,7 +2152,7 @@ def _preview_signal_with_progress(preview_row: dict[str, object]) -> tuple[list[
     progress.progress(0.75, text=f"Evaluating signal components for {len(frames):,} symbols...")
     _raise_if_preview_cancelled()
 
-    results = evaluate_signal(definition, frames)
+    results = evaluate_signal(definition, frames, price_targets)
     duration = time.monotonic() - started
     progress.progress(1.0, text=f"Preview complete: {len(results):,} scored symbols in {duration:.1f}s")
     status.success(f"Preview complete in {duration:.1f}s. Scored {len(results):,} symbols.")

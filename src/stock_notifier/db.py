@@ -951,6 +951,62 @@ class Database:
         )
         return [dict(row) for row in rows]
 
+    def price_targets_for_symbols(self, symbols: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
+        requested = sorted({symbol.upper().strip() for symbol in symbols if symbol.strip()})
+        if not requested:
+            return {}
+        placeholders = ", ".join("?" for _ in requested)
+        rows = self.query(
+            f"""
+            SELECT
+                p.symbol,
+                p.brokerage,
+                p.company_name,
+                p.action,
+                p.rating,
+                p.target_price,
+                COALESCE(p.price_then, p.source_current_price, then_bar.close) AS price_then,
+                p.source_current_price,
+                p.effective_date,
+                p.captured_at,
+                reached.reached_date
+            FROM price_targets_latest p
+            LEFT JOIN daily_bars then_bar
+              ON then_bar.symbol=p.symbol
+             AND then_bar.trading_date = (
+                SELECT MAX(b2.trading_date)
+                FROM daily_bars b2
+                WHERE b2.symbol=p.symbol
+                  AND p.effective_date <> ''
+                  AND b2.trading_date <= p.effective_date
+             )
+            LEFT JOIN (
+                SELECT
+                    p2.symbol,
+                    p2.brokerage,
+                    MIN(b.trading_date) AS reached_date
+                FROM price_targets_latest p2
+                JOIN daily_bars b ON b.symbol=p2.symbol
+                WHERE p2.target_price IS NOT NULL
+                  AND p2.effective_date <> ''
+                  AND b.trading_date >= p2.effective_date
+                  AND (
+                    (COALESCE(p2.price_then, p2.source_current_price, 0) <= p2.target_price AND b.high >= p2.target_price)
+                    OR
+                    (COALESCE(p2.price_then, p2.source_current_price, 0) > p2.target_price AND b.low <= p2.target_price)
+                  )
+                GROUP BY p2.symbol, p2.brokerage
+            ) reached ON reached.symbol=p.symbol AND reached.brokerage=p.brokerage
+            WHERE p.symbol IN ({placeholders})
+            ORDER BY p.symbol, p.effective_date DESC, p.brokerage ASC
+            """,
+            tuple(requested),
+        )
+        grouped: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in requested}
+        for row in rows:
+            grouped.setdefault(str(row["symbol"]), []).append(dict(row))
+        return grouped
+
     def upsert_company_profile(self, profile: CompanyProfile) -> None:
         now = datetime.now(UTC).isoformat()
         with self.connect() as connection:

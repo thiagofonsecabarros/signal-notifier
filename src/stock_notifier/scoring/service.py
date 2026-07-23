@@ -43,10 +43,17 @@ def required_history_bars(config: dict, *, minimum: int = 30, maximum: int = 320
         elif component_type == "price_change_pct":
             days = int(params.get("days") or component.get("days") or 5)
             required = max(required, days + 1)
-        elif component_type in {"latest_volume", "dollar_volume"}:
+        elif component_type in {"latest_volume", "dollar_volume", "price_target"}:
             required = max(required, 1)
     # A small buffer helps EMA/ADX stabilize and prevents exact-boundary surprises.
     return max(1, min(int(required) + 5, int(maximum)))
+
+
+def _uses_price_targets(config: dict) -> bool:
+    return any(
+        str(dict(component or {}).get("type") or "").strip() == "price_target"
+        for component in list(dict(config or {}).get("components") or [])
+    )
 
 
 def score_signal(
@@ -84,13 +91,14 @@ def score_signal(
         min_bars=required_history_bars(config),
         include_latest_snapshot=include_latest_snapshot,
     )
+    price_targets = database.price_targets_for_symbols(history.keys()) if _uses_price_targets(config) else {}
     definition = SignalDefinition(
         name=str(signal_row["name"]),
         config=config,
         signal_id=int(signal_row["id"]),
         enabled=bool(signal_row["enabled"]),
     )
-    results = evaluate_signal(definition, _history_frames(history))
+    results = evaluate_signal(definition, _history_frames(history), price_targets)
 
     if store:
         run_id = database.start_signal_run(definition.signal_id, definition.name)
@@ -202,7 +210,8 @@ def score_enabled_signals_grouped(
             for symbol, frame in frames.items()
             if symbol in selected_symbols
         }
-        scored = evaluate_signal(definition, selected_frames)
+        price_targets = database.price_targets_for_symbols(selected_frames.keys()) if _uses_price_targets(definition.config) else {}
+        scored = evaluate_signal(definition, selected_frames, price_targets)
         run_id = database.start_signal_run(definition.signal_id, definition.name)
         try:
             count = database.store_signal_scores(
