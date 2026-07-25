@@ -314,6 +314,8 @@ def run_market_snapshot_service(database: Database, settings: Settings) -> tuple
         filtered.sort(key=_snapshot_dollar_volume, reverse=True)
         selected_snapshots = filtered[:max_store]
         stored = database.upsert_market_snapshots(selected_snapshots)
+        history_rows = database.append_market_snapshot_history(selected_snapshots)
+        history_pruned = database.prune_market_snapshot_history()
         duration = time.monotonic() - started
         database.finish_service_run(
             run_id,
@@ -322,12 +324,16 @@ def run_market_snapshot_service(database: Database, settings: Settings) -> tuple
             success_count=stored,
             skipped_count=max(len(snapshots) - stored, 0),
             duration_seconds=duration,
-            message=f"scheduled=true, universe_symbols={universe_symbols}, matched={len(filtered)}, stored={stored}",
+            message=(
+                f"scheduled=true, universe_symbols={universe_symbols}, matched={len(filtered)}, "
+                f"stored={stored}, intraday_rows={history_rows}, intraday_pruned={history_pruned}"
+            ),
         )
         return "success", (
             "Market snapshot scheduled run complete: "
             f"fetched={len(snapshots):,}, universe_symbols={universe_symbols:,}, "
-            f"matched={len(filtered):,}, stored={stored:,}, duration={duration:.1f}s"
+            f"matched={len(filtered):,}, stored={stored:,}, "
+            f"intraday_rows={history_rows:,}, pruned={history_pruned:,}, duration={duration:.1f}s"
         ), run_id
     except Exception as exc:
         database.finish_service_run(run_id, status="failed", error_count=1, duration_seconds=time.monotonic() - started, message=str(exc))
@@ -401,23 +407,36 @@ def run_company_profiles_service(database: Database, settings: Settings) -> tupl
         return "failed", f"Company profiles scheduled run failed: {exc}", run_id
 
 
-def _historical_bar_counts(database: Database, symbols: list[str], start: date, end: date) -> dict[str, int]:
+def _historical_bar_stats(database: Database, symbols: list[str], start: date, end: date) -> dict[str, dict[str, object]]:
     if not symbols:
         return {}
     placeholders = ", ".join("?" for _ in symbols)
     rows = database.query(
         f"""
-        SELECT symbol, COUNT(*) AS bar_count
+        SELECT symbol,
+               COUNT(*) AS bar_count,
+               MAX(DATE(trading_date)) AS latest_trading_date
         FROM daily_bars
         WHERE symbol IN ({placeholders})
-          AND trading_date >= ?
-          AND trading_date <= ?
+          AND DATE(trading_date) >= ?
+          AND DATE(trading_date) <= ?
         GROUP BY symbol
         """,
         tuple(symbols) + (start.isoformat(), end.isoformat()),
     )
-    counts = {str(row["symbol"]): int(row["bar_count"] or 0) for row in rows}
-    return {symbol: counts.get(symbol, 0) for symbol in symbols}
+    stats = {
+        str(row["symbol"]): {
+            "bar_count": int(row["bar_count"] or 0),
+            "latest_trading_date": row["latest_trading_date"],
+        }
+        for row in rows
+    }
+    return {symbol: stats.get(symbol, {"bar_count": 0, "latest_trading_date": None}) for symbol in symbols}
+
+
+def _historical_bar_counts(database: Database, symbols: list[str], start: date, end: date) -> dict[str, int]:
+    stats = _historical_bar_stats(database, symbols, start, end)
+    return {symbol: int(values.get("bar_count") or 0) for symbol, values in stats.items()}
 
 
 def run_historical_data_service(database: Database, settings: Settings) -> tuple[str, str, int | None]:
@@ -437,9 +456,15 @@ def run_historical_data_service(database: Database, settings: Settings) -> tuple
     start_date = end_date - timedelta(days=max(years, 1) * 365)
     expected_bars = max(int(max(years, 1) * 252), 1)
     complete_bars = max(int(expected_bars * coverage_threshold_pct / 100), 1)
+    freshness_cutoff = end_date - timedelta(days=3)
     scope_symbols = _profile_scope_symbols(database, scope=scope, selected_lists=selected_lists, typed_symbols=typed_symbols)
-    bar_counts = _historical_bar_counts(database, scope_symbols, start_date, end_date)
-    complete_symbols = {symbol for symbol, count in bar_counts.items() if count >= complete_bars}
+    bar_stats = _historical_bar_stats(database, scope_symbols, start_date, end_date)
+    complete_symbols = {
+        symbol
+        for symbol, values in bar_stats.items()
+        if int(values.get("bar_count") or 0) >= complete_bars
+        and str(values.get("latest_trading_date") or "") >= freshness_cutoff.isoformat()
+    }
     pending = [symbol for symbol in scope_symbols if symbol not in complete_symbols] if mode == "Only incomplete history" else scope_symbols
     chunks_remaining = (len(pending) + max(chunk_size, 1) - 1) // max(chunk_size, 1)
     run_chunk_count = chunks_remaining if run_all_remaining else min(max(chunks_to_run, 1), chunks_remaining)
@@ -561,6 +586,173 @@ def _send_service_notification(database: Database, settings: Settings, *, servic
     return result.ok
 
 
+def _format_money(value: Any) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if numeric >= 1000:
+        return f"${numeric:,.0f}"
+    return f"${numeric:,.2f}"
+
+
+def _format_pct(value: Any) -> str:
+    try:
+        return f"{float(value):+.1f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _diff_marker(value: Any) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return " "
+    if numeric > 0:
+        return "🟢"
+    if numeric < 0:
+        return "🔴"
+    return "⚪"
+
+
+def _price_target_report_text(
+    database: Database,
+    *,
+    status: str,
+    message: str,
+    dashboard_base_url: str = "",
+) -> str:
+    service_status = database.price_target_service_status()
+    target_date = str(service_status.get("latest_effective_date") or "")
+    update_rows = database.price_target_daily_update_leaders(effective_date=target_date, limit=5)
+    average_rows = database.price_target_daily_average_leaders(effective_date=target_date, limit=5)
+    strength_rows = database.price_target_strength_leaders(limit=10)
+    mentioned_symbols: list[str] = []
+    for rows in (update_rows, average_rows, strength_rows):
+        for row in rows:
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if symbol and symbol not in mentioned_symbols:
+                mentioned_symbols.append(symbol)
+
+    lines = [
+        f"🎯 <b>Price targets {escape(status)}</b>",
+        escape(message),
+        "",
+        f"<b>Latest target date:</b> {escape(target_date or '—')}",
+        "",
+        "<b>Top 5 most target updates today</b>",
+        "<pre>Sym    Cnt  $ Today   $ Trgt  Diff %",
+    ]
+    if update_rows:
+        for row in update_rows:
+            lines.append(
+                f"{str(row.get('symbol') or '')[:6]:<6} "
+                f"{int(row.get('update_count') or 0):>3} "
+                f"{_format_money(row.get('price_today')):>8} "
+                f"{_format_money(row.get('average_target_price')):>8} "
+                f"{_diff_marker(row.get('target_diff_pct'))}{_format_pct(row.get('target_diff_pct')):>7}"
+            )
+    else:
+        lines.append("No target-update rows.")
+    lines.append("</pre>")
+
+    lines.extend(["", "<b>Top 5 highest avg targets today</b>", "<pre>Sym    Cnt  $ Today   $ Trgt  Diff %"])
+    if average_rows:
+        for row in average_rows:
+            lines.append(
+                f"{str(row.get('symbol') or '')[:6]:<6} "
+                f"{int(row.get('target_count') or 0):>3} "
+                f"{_format_money(row.get('price_today')):>8} "
+                f"{_format_money(row.get('average_target_price')):>8} "
+                f"{_diff_marker(row.get('target_diff_pct'))}{_format_pct(row.get('target_diff_pct')):>7}"
+            )
+    else:
+        lines.append("No target-average rows.")
+    lines.append("</pre>")
+
+    lines.extend(["", "<b>Top 10 Target Strength</b>", "<pre>Sym   Score Cnt Upside  Price"])
+    if strength_rows:
+        for row in strength_rows:
+            lines.append(
+                f"{str(row.get('symbol') or '')[:5]:<5} "
+                f"{float(row.get('target_strength') or 0):>5.1f} "
+                f"{int(row.get('unreached_target_count') or 0):>3} "
+                f"{_format_pct(row.get('average_upside_pct')):>7} "
+                f"{_format_money(row.get('price_now')):>7}"
+            )
+    else:
+        lines.append("No unreached bullish targets with current prices.")
+    lines.append("</pre>")
+    if dashboard_base_url:
+        lines.append("")
+        lines.append(f'Dashboard: <a href="{escape(dashboard_base_url)}">{escape(dashboard_base_url)}</a>')
+    if mentioned_symbols:
+        lines.extend(["", "<b>Asset links</b>"])
+        for symbol in mentioned_symbols[:20]:
+            tradingview_url = f"https://www.tradingview.com/chart/?symbol={quote(symbol)}"
+            yahoo_url = f"https://finance.yahoo.com/quote/{quote(symbol)}"
+            lines.append(
+                f'{escape(symbol)}: '
+                f'<a href="{escape(tradingview_url)}">TradingView</a> · '
+                f'<a href="{escape(yahoo_url)}">Yahoo</a>'
+            )
+    return "\n".join(lines)
+
+
+def _send_price_target_report_notification(
+    database: Database,
+    settings: Settings,
+    *,
+    status: str,
+    message: str,
+) -> bool:
+    schedule = get_service_schedule(database, "price_targets")
+    if not bool(schedule.get("notify_telegram")):
+        return False
+    text = _price_target_report_text(
+        database,
+        status=status,
+        message=message,
+        dashboard_base_url=settings.dashboard_base_url,
+    )
+    request_payload = {
+        "chat_id": settings.telegram_chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "kind": "scheduled-service",
+        "service": "price_targets",
+        "service_label": SERVICE_LABELS["price_targets"],
+        "service_status": status,
+        "report_type": "price-target-mini-report",
+    }
+    if settings.alert_dry_run:
+        database.record_notification_delivery(
+            alert_id=None,
+            channel_type="telegram",
+            status="dry_run",
+            request=request_payload,
+            response={"dry_run": True, "kind": "scheduled-service", "report_type": "price-target-mini-report"},
+        )
+        return False
+    result = TelegramClient(settings.telegram_bot_token, timeout_seconds=settings.http_timeout_seconds).send_message(
+        chat_id=settings.telegram_chat_id,
+        text=text,
+    )
+    database.record_notification_delivery(
+        alert_id=None,
+        channel_type="telegram",
+        status="delivered" if result.ok else "failed",
+        request={
+            **result.request,
+            **{key: value for key, value in request_payload.items() if key not in result.request},
+        },
+        response=result.response,
+        error_text=result.error_text,
+    )
+    return result.ok
+
+
 def run_service(database: Database, settings: Settings, service_key: str) -> ScheduledServiceResult:
     if service_key == "snapshot":
         status, message, run_id = run_market_snapshot_service(database, settings)
@@ -573,7 +765,10 @@ def run_service(database: Database, settings: Settings, service_key: str) -> Sch
     else:
         raise ValueError(f"Unsupported service key: {service_key}")
     set_dashboard_setting(database, f"services.{service_key}.last_scheduled_run_at", datetime.now(UTC).isoformat())
-    _send_service_notification(database, settings, service_key=service_key, status=status, message=message)
+    if service_key == "price_targets":
+        _send_price_target_report_notification(database, settings, status=status, message=message)
+    else:
+        _send_service_notification(database, settings, service_key=service_key, status=status, message=message)
     return ScheduledServiceResult(service_key, SERVICE_LABELS.get(service_key, service_key), True, True, status, message, run_id)
 
 

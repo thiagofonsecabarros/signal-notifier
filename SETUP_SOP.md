@@ -117,6 +117,8 @@ Keep it disabled until `stock-notifier run-scan-cycle --dry-run --benchmark --ma
 
 The services scheduler timer wakes every 5 minutes and calls `stock-notifier services-run-due`. Configure service schedules in the Services tab and signal schedules in Signal Builder. The scheduler uses the saved service/signal settings and can optionally send Telegram completion/error notifications or compact signal digests. Test manually with `stock-notifier services-run-due --service snapshot --force` or `stock-notifier services-run-due --signal SIGNAL_ID --force`.
 
+Market snapshot service runs append intraday datapoints to `market_snapshot_history`. The app keeps the latest valid trading day's intraday rows for stock-detail Intraday charts, including over weekends/holidays. Older trading dates are pruned only after a newer trading date has enough active symbols and total volume, which protects Friday data from being erased by small/off-hours test pulls.
+
 Install and enable the services scheduler timer only once, unless the files in `deploy/` change or
 the timer was disabled. Creating or editing service/signal schedules in the dashboard updates SQLite settings; it
 does not require another `sudo cp`, `daemon-reload`, or `enable --now`.
@@ -175,7 +177,7 @@ sudo -u stocknotifier sqlite3 /opt/stock-notifier/data/stock_notifier.db \
 3. **Phase 3 — notifications:** Telegram bot/chat, dry-run mode, alert rules, dedupe/crossing
    state, pending alerts, delivery attempts, alert history, Signal Builder test alerts, and
    Latest runs delivery history.
-4. **Phase 4 — delayed intraday:** Massive full-market snapshots, short intraday snapshot history,
+4. **Phase 4 — delayed intraday:** Massive full-market snapshots, latest-valid-trading-day intraday snapshot history,
    VM-safe filtering, grouped scoring, scan-cycle runs, and 15-minute timer support.
 5. **Phase 5 — schedulers:** dashboard-managed market snapshot, price-target ingestion, historical
    backfill, and company profile ingestion; persisted service options; per-signal scheduler controls;

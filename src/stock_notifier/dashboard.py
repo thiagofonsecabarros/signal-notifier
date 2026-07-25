@@ -28,6 +28,7 @@ from stock_notifier.services.scheduler import (
     run_signal_test_alert,
     save_service_schedule,
     save_signal_schedule,
+    _send_price_target_report_notification,
 )
 
 st.set_page_config(page_title="Stock Signal Notifier", layout="wide")
@@ -534,29 +535,42 @@ def _sync_profile_chunk(symbols: list[str], *, requests_per_minute: int) -> dict
     }
 
 
-def _historical_bar_counts(symbols: list[str], start: date, end: date) -> dict[str, int]:
+def _historical_bar_stats(symbols: list[str], start: date, end: date) -> dict[str, dict[str, object]]:
     if not symbols:
         return {}
     placeholders = ", ".join("?" for _ in symbols)
     rows = database.query(
         f"""
-        SELECT symbol, COUNT(*) AS bar_count
+        SELECT symbol,
+               COUNT(*) AS bar_count,
+               MAX(DATE(trading_date)) AS latest_trading_date
         FROM daily_bars
         WHERE symbol IN ({placeholders})
-          AND trading_date >= ?
-          AND trading_date <= ?
+          AND DATE(trading_date) >= ?
+          AND DATE(trading_date) <= ?
         GROUP BY symbol
         """,
         tuple(symbols) + (start.isoformat(), end.isoformat()),
     )
-    counts = {str(row["symbol"]): int(row["bar_count"] or 0) for row in rows}
-    return {symbol: counts.get(symbol, 0) for symbol in symbols}
+    stats = {
+        str(row["symbol"]): {
+            "bar_count": int(row["bar_count"] or 0),
+            "latest_trading_date": row["latest_trading_date"],
+        }
+        for row in rows
+    }
+    return {symbol: stats.get(symbol, {"bar_count": 0, "latest_trading_date": None}) for symbol in symbols}
+
+
+def _historical_bar_counts(symbols: list[str], start: date, end: date) -> dict[str, int]:
+    stats = _historical_bar_stats(symbols, start, end)
+    return {symbol: int(values.get("bar_count") or 0) for symbol, values in stats.items()}
 
 
 def _historical_progress_frame(symbols: list[str], start: date, end: date, expected_bars: int) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
-    counts = _historical_bar_counts(symbols, start, end)
+    stats = _historical_bar_stats(symbols, start, end)
     placeholders = ", ".join("?" for _ in symbols)
     names = read_frame(
         f"""
@@ -574,9 +588,10 @@ def _historical_progress_frame(symbols: list[str], start: date, end: date, expec
             {
                 "ticker": symbol,
                 "name": name_map.get(symbol, ""),
-                "stored_bars_in_range": counts.get(symbol, 0),
+                "stored_bars_in_range": int(stats.get(symbol, {}).get("bar_count") or 0),
+                "latest_trading_date": stats.get(symbol, {}).get("latest_trading_date"),
                 "target_bars_estimate": expected_bars,
-                "coverage_pct": round(100.0 * counts.get(symbol, 0) / max(expected_bars, 1), 1),
+                "coverage_pct": round(100.0 * int(stats.get(symbol, {}).get("bar_count") or 0) / max(expected_bars, 1), 1),
             }
             for symbol in symbols
         ]
@@ -715,6 +730,48 @@ def _symbol_history(symbol: str, db_cache_key: float) -> pd.DataFrame:
         return history
     history["trading_date"] = pd.to_datetime(history["trading_date"], errors="coerce")
     history = history.dropna(subset=["trading_date"]).sort_values("trading_date").reset_index(drop=True)
+    return history
+
+
+@st.cache_data(ttl=120)
+def _symbol_intraday_history(symbol: str, db_cache_key: float) -> pd.DataFrame:
+    del db_cache_key  # only used to invalidate cache when the SQLite file changes
+    if not settings.db_path.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(settings.db_path) as connection:
+        history = pd.read_sql_query(
+            """
+            WITH latest_day AS (
+                SELECT MAX(trading_date) AS trading_date
+                FROM market_snapshot_history
+                WHERE symbol = ?
+            )
+            SELECT snapshot_at AS trading_date,
+                   price AS open,
+                   price AS high,
+                   price AS low,
+                   price AS close,
+                   day_volume,
+                   percent_change,
+                   market_snapshot_history.trading_date AS snapshot_trading_date
+            FROM market_snapshot_history
+            JOIN latest_day
+              ON latest_day.trading_date = market_snapshot_history.trading_date
+            WHERE symbol = ?
+            ORDER BY snapshot_at
+            """,
+            connection,
+            params=(symbol, symbol),
+        )
+    if history.empty:
+        return history
+    history["trading_date"] = pd.to_datetime(history["trading_date"], errors="coerce")
+    history["day_volume"] = pd.to_numeric(history["day_volume"], errors="coerce")
+    history = history.dropna(subset=["trading_date"]).sort_values("trading_date").reset_index(drop=True)
+    interval_volume = history["day_volume"].diff()
+    history["volume"] = interval_volume.where(interval_volume >= 0, history["day_volume"]).fillna(history["day_volume"])
+    history["trade_index"] = range(len(history))
+    history["date_label"] = history["trading_date"].dt.tz_convert(settings.alert_default_timezone).dt.strftime("%H:%M")
     return history
 
 
@@ -1049,10 +1106,15 @@ def _render_stock_detail(symbol: str) -> None:
         key=f"detail_chart_range_{symbol}",
     )
     with st.spinner(f"Loading chart history for {symbol}..."):
-        history = _symbol_history(symbol, _db_cache_key())
-        visible_history = _history_for_range(history, selected_range)
+        if selected_range == "Intraday":
+            visible_history = _symbol_intraday_history(symbol, _db_cache_key())
+        else:
+            history = _symbol_history(symbol, _db_cache_key())
+            visible_history = _history_for_range(history, selected_range)
     if selected_range == "Intraday":
-        st.info("Intraday data is not enabled yet, so this shows the latest available daily bar for now.")
+        if not visible_history.empty:
+            trading_day = str(visible_history.get("snapshot_trading_date", pd.Series([""])).iloc[-1] or "")
+            st.caption(f"Intraday snapshot history for latest stored trading date: {trading_day or '—'}")
     _render_price_volume_chart(visible_history, symbol)
 
     list_frame = _stock_detail_lists(symbol)
@@ -3095,6 +3157,8 @@ def _render_services() -> None:
                 selected_snapshots = filtered[: int(max_store)]
 
                 stored = database.upsert_market_snapshots(selected_snapshots)
+                history_rows = database.append_market_snapshot_history(selected_snapshots)
+                history_pruned = database.prune_market_snapshot_history()
                 st.cache_data.clear()
                 duration = time.monotonic() - started
                 database.finish_service_run(
@@ -3104,12 +3168,15 @@ def _render_services() -> None:
                     success_count=stored,
                     skipped_count=max(len(snapshots) - stored, 0),
                     duration_seconds=duration,
-                    message=f"universe_symbols={universe_symbols}, matched={len(filtered)}, stored={stored}",
+                    message=(
+                        f"universe_symbols={universe_symbols}, matched={len(filtered)}, stored={stored}, "
+                        f"intraday_rows={history_rows}, intraday_pruned={history_pruned}"
+                    ),
                 )
                 st.success(
                     "Market snapshot complete: "
                     f"fetched={len(snapshots):,}, universe_symbols={universe_symbols:,}, matched={len(filtered):,}, "
-                    f"stored={stored:,}, duration={duration:.1f}s"
+                    f"stored={stored:,}, intraday_rows={history_rows:,}, pruned={history_pruned:,}, duration={duration:.1f}s"
                 )
                 if selected_snapshots:
                     st.markdown("#### Stored snapshot preview")
@@ -3207,6 +3274,19 @@ def _render_services() -> None:
                     ),
                 )
                 st.cache_data.clear()
+                report_status = "success" if result.stored_latest or result.stored_events else "partial"
+                report_message = (
+                    "Price targets manual run complete: "
+                    f"fetched={result.fetched:,}, stored_latest={result.stored_latest:,}, "
+                    f"events={result.stored_events:,}, skipped_unknown={result.skipped_unknown:,}, "
+                    f"duration={duration:.1f}s"
+                )
+                _send_price_target_report_notification(
+                    database,
+                    settings,
+                    status=report_status,
+                    message=report_message,
+                )
                 st.success(
                     "Price targets complete: "
                     f"fetched={result.fetched:,}, stored_latest={result.stored_latest:,}, "
@@ -3220,6 +3300,12 @@ def _render_services() -> None:
                     error_count=1,
                     duration_seconds=time.monotonic() - started,
                     message=str(exc),
+                )
+                _send_price_target_report_notification(
+                    database,
+                    settings,
+                    status="failed",
+                    message=f"Price targets manual run failed: {exc}",
                 )
                 st.cache_data.clear()
                 st.error(f"Price targets failed: {exc}")
@@ -3387,8 +3473,14 @@ def _render_services() -> None:
             selected_lists=historical_lists,
             typed_symbols=historical_typed_symbols,
         )
-        bar_counts = _historical_bar_counts(scope_symbols, start_date, end_date)
-        complete_symbols = {symbol for symbol, count in bar_counts.items() if count >= complete_bars}
+        freshness_cutoff = end_date - timedelta(days=3)
+        bar_stats = _historical_bar_stats(scope_symbols, start_date, end_date)
+        complete_symbols = {
+            symbol
+            for symbol, values in bar_stats.items()
+            if int(values.get("bar_count") or 0) >= complete_bars
+            and str(values.get("latest_trading_date") or "") >= freshness_cutoff.isoformat()
+        }
         pending_symbols = (
             [symbol for symbol in scope_symbols if symbol not in complete_symbols]
             if history_mode == "Only incomplete history"

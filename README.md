@@ -210,6 +210,9 @@ Market snapshot ingestion:
 - uses Massive's full-market snapshot endpoint;
 - adds every fetched snapshot ticker to the `symbols` universe before applying filters;
 - stores lightweight fields: last price, change %, previous close, volume, and dollar volume;
+- appends latest-valid-trading-day intraday datapoints to `market_snapshot_history` for intraday charts;
+- keeps the latest valid trading day's intraday rows until a newer valid trading day is detected, so Friday intraday data survives weekends/holidays;
+- prunes older intraday days only after the newest trading date passes activity safeguards, currently enough symbols with volume and enough total day volume;
 - can run for the full stock universe, selected lists, typed tickers, or lists plus typed tickers;
 - supports minimum price, volume, dollar-volume, and max-symbol filters for stored snapshot rows, not for universe membership;
 - is the preferred first step before heavier enrichment jobs.
@@ -239,7 +242,11 @@ Price target ingestion:
 - stores the latest target per symbol/brokerage plus a deduplicated event history;
 - powers the **Market Data → Price Target** reference column using the average latest target for each stock;
 - powers **Stock details → Brokerage price targets**, including price then, price now, change since target, target upside, and reached status;
-- runs manually or through the Services scheduler and logs as `price_targets` in **Latest runs → Service runs**.
+- runs manually or through the Services scheduler and logs as `price_targets` in **Latest runs → Service runs**;
+- if Telegram is enabled for the service, sends a mini-report instead of a generic completion message:
+  - Top 5 assets with most target updates for the latest target date;
+  - Top 5 assets with highest average targets from that latest target date;
+  - Top 10 Target Strength across all latest unreached bullish targets, blending unreached target count, expected upside from current price, and recency.
 
 For the full stock universe, market snapshots are fast enough to run frequently. Company profiles are slower because they require one ticker-overview request per symbol; prefer selected lists, safe request pacing, or the all-remaining option as a scheduled/overnight job instead of a huge interactive daytime dashboard run.
 
@@ -282,8 +289,10 @@ stock-notifier services-run-due --test-alert 1
 The scan cycle performs:
 
 ```text
-full-market snapshot → latest snapshot + 10-hour intraday history → price/volume filters → grouped scoring for enabled signals → scheduled alert scan → Telegram/dry-run
+full-market snapshot → latest snapshot + latest-valid-trading-day intraday history → price/volume filters → grouped scoring for enabled signals → scheduled alert scan → Telegram/dry-run
 ```
+
+Intraday history is current-trading-day based, not fixed-clock retention. Each snapshot pull writes 15-minute-style datapoints to `market_snapshot_history`. When the next real trading day starts, older trading-date rows are pruned after the new day has enough active symbols/volume to avoid accidentally deleting Friday data because of an off-hours, weekend, holiday, or small manual test pull.
 
 ## Dashboard
 
@@ -731,7 +740,7 @@ When a scheduled signal is due, the services scheduler performs:
 Massive full-market snapshot freshness check
 → fetch snapshot if needed, or reuse recent snapshots
 → update latest snapshots for that signal universe
-→ append short intraday snapshot history
+→ append latest-valid-trading-day intraday snapshot history
 → score the signal using the refreshed snapshot as latest data
 → evaluate alert rules for that signal only
 → optionally send a compact Telegram digest
@@ -1072,7 +1081,7 @@ Current SQLite schema includes:
 - `company_profiles`
 - `daily_bars`
 - `market_snapshots`
-- `market_snapshot_history`
+- `market_snapshot_history` — current/latest valid trading day's intraday snapshot rows, used by the Intraday stock-detail chart
 - `price_targets_latest`
 - `price_target_events`
 - `fetch_log`

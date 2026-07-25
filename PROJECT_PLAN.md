@@ -10,7 +10,7 @@
 The Signal Notifier application now has the main US-focused MVP pieces implemented:
 
 - Oracle/Ubuntu deployment with Streamlit behind Caddy.
-- SQLite storage for symbols, lists, company profiles, daily bars, latest snapshots, short intraday snapshot history, brokerage price targets, signals, scores, alerts, notification deliveries, service runs, app settings, and scan-cycle runs.
+- SQLite storage for symbols, lists, company profiles, daily bars, latest snapshots, latest-valid-trading-day intraday snapshot history, brokerage price targets, signals, scores, alerts, notification deliveries, service runs, app settings, and scan-cycle runs.
 - Massive reference-ticker sync for active US stock universe metadata, plus full-market snapshot ingestion that refreshes tradable snapshot symbols without letting liquidity filters shrink the master universe.
 - Configurable Signal Builder with score components, gate/filter components, preview rankings, saved signal definitions, and signal-derived list creation.
 - Signal Builder includes a Price Target component that can gate/score stocks using unreached brokerage target count, expected upside from current price, and target recency.
@@ -19,8 +19,10 @@ The Signal Notifier application now has the main US-focused MVP pieces implement
 - E2-safe 15-minute scan-cycle pipeline:
 
 ```text
-Massive full-market snapshot → latest snapshot + short intraday history → price/volume filters → grouped signal scoring → alert evaluation → Telegram/dry-run → run health
+Massive full-market snapshot → latest snapshot + latest-valid-trading-day intraday history → price/volume filters → grouped signal scoring → alert evaluation → Telegram/dry-run → run health
 ```
+
+Intraday snapshot history is retained by trading date instead of by a fixed hour window. The latest valid trading day remains available for stock-detail Intraday charts over weekends and holidays; older trading dates are pruned only after a newer trading date has enough active symbols and total volume to look like a real market session.
 
 - Services tab with persisted options for market snapshot ingestion, PriceTargets.com brokerage target ingestion, historical data backfill, and company profile ingestion; historical/profile services can run one chunk or all remaining chunks automatically.
 - Service scheduler controls per service and per signal: enabled flag, frequency amount/unit, start/end time for minute schedules, weekday filters, and optional Telegram completion/error notices.
@@ -198,9 +200,9 @@ Finviz Elite ($39.50/mo, or $24.96/mo billed annually) + Trade Ideas ($127–254
 1. **Foundation:** local setup, Oracle deployment, SQLite schema, data ingestion, dashboard, Caddy, and basic timers.
 2. **Signal Builder:** configurable SQLite-backed signal definitions with weighted score components and gates.
 3. **Telegram alerts:** Bot API outbound messages, alert rules, dedupe/crossing state, dry-run mode, delivery history, Signal Builder test alerts, and scheduled signal/service digests.
-4. **15-minute scan cycle:** full-market snapshot ingestion, short intraday snapshot history, E2-safe prefilters, grouped scoring, alert evaluation, and scan-cycle health logging.
+4. **15-minute scan cycle:** full-market snapshot ingestion, latest-valid-trading-day intraday snapshot history, E2-safe prefilters, grouped scoring, alert evaluation, and scan-cycle health logging.
 5. **Services + signal scheduler:** dashboard-managed market snapshot, price-target ingestion, historical backfill, and company profile jobs with persisted options, service-run logs, systemd wake timer, per-signal scheduled scoring, snapshot reuse, and optional Telegram completion/error notices or top-10 signal digests.
-6. **Price target context:** import/export tools for existing Investment Analysis price-target rows, latest target average in Market Data, and brokerage-level price target detail with reached-status context inside Stock details.
+6. **Price target context:** import/export tools for existing Investment Analysis price-target rows, latest target average in Market Data, brokerage-level price target detail with reached-status context inside Stock details, Price Target signal component, and Telegram mini-reports for scheduled/manual target ingestion runs.
 
 **Next implementation priorities:**
 

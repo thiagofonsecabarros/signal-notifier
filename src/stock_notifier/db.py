@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from stock_notifier.models import CompanyProfile, DailyBar, MarketSnapshot, PriceTarget, Symbol
 
@@ -264,6 +265,7 @@ CREATE TABLE IF NOT EXISTS market_snapshot_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL REFERENCES symbols(ticker),
     snapshot_at TEXT NOT NULL,
+    trading_date TEXT,
     price REAL NOT NULL,
     percent_change REAL,
     day_volume REAL,
@@ -405,6 +407,31 @@ class Database:
         for column, definition in alert_rule_additions.items():
             if column not in alert_rule_columns:
                 connection.execute(f"ALTER TABLE alert_rules ADD COLUMN {column} {definition}")
+
+        snapshot_history_columns = self._columns(connection, "market_snapshot_history")
+        if "trading_date" not in snapshot_history_columns:
+            connection.execute("ALTER TABLE market_snapshot_history ADD COLUMN trading_date TEXT")
+            connection.execute(
+                """
+                UPDATE market_snapshot_history
+                SET trading_date = DATE(snapshot_at)
+                WHERE trading_date IS NULL OR trading_date = ''
+                """
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_market_snapshot_history_trading_date
+            ON market_snapshot_history(trading_date, symbol, snapshot_at)
+            """
+        )
+
+    @staticmethod
+    def _snapshot_trading_date(snapshot_at: datetime, timezone: str = "America/Toronto") -> str:
+        try:
+            local_time = snapshot_at.astimezone(ZoneInfo(timezone))
+        except Exception:
+            local_time = snapshot_at.astimezone(UTC)
+        return local_time.date().isoformat()
 
     def sync_symbols(self, symbols: Iterable[Symbol]) -> int:
         now = datetime.now(UTC).isoformat()
@@ -683,6 +710,7 @@ class Database:
                 (
                     snapshot.symbol,
                     snapshot.snapshot_at.isoformat(),
+                    self._snapshot_trading_date(snapshot.snapshot_at),
                     snapshot.price,
                     snapshot.percent_change,
                     snapshot.day_volume,
@@ -696,10 +724,11 @@ class Database:
             connection.executemany(
                 """
                 INSERT INTO market_snapshot_history(
-                    symbol, snapshot_at, price, percent_change, day_volume, dollar_volume, fetched_at
+                    symbol, snapshot_at, trading_date, price, percent_change, day_volume, dollar_volume, fetched_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, snapshot_at) DO UPDATE SET
+                    trading_date=excluded.trading_date,
                     price=excluded.price,
                     percent_change=excluded.percent_change,
                     day_volume=excluded.day_volume,
@@ -710,20 +739,55 @@ class Database:
             )
         return len(rows)
 
-    def prune_market_snapshot_history(self, *, keep_hours: float = 10.0) -> int:
-        cutoff = datetime.now(UTC) - timedelta(hours=max(float(keep_hours), 0.0))
+    def prune_market_snapshot_history(
+        self,
+        *,
+        keep_hours: float = 10.0,
+        min_active_symbols: int = 100,
+        min_total_day_volume: float = 1_000_000.0,
+    ) -> int:
+        del keep_hours  # retained for backward-compatible callers; pruning is trading-date based.
         with self.connect() as connection:
+            latest_rows = connection.execute(
+                """
+                SELECT trading_date,
+                       COUNT(*) AS row_count,
+                       SUM(CASE WHEN COALESCE(day_volume, 0) > 0 THEN 1 ELSE 0 END) AS active_symbols,
+                       SUM(COALESCE(day_volume, 0)) AS total_day_volume
+                FROM market_snapshot_history
+                WHERE trading_date IS NOT NULL AND trading_date <> ''
+                GROUP BY trading_date
+                ORDER BY trading_date DESC
+                LIMIT 1
+                """
+            ).fetchall()
+            if not latest_rows:
+                return 0
+            latest = latest_rows[0]
+            latest_trading_date = str(latest["trading_date"] or "")
+            active_symbols = int(latest["active_symbols"] or 0)
+            total_day_volume = float(latest["total_day_volume"] or 0.0)
+            if (
+                not latest_trading_date
+                or active_symbols < max(int(min_active_symbols), 1)
+                or total_day_volume < max(float(min_total_day_volume), 0.0)
+            ):
+                return 0
             cursor = connection.execute(
-                "DELETE FROM market_snapshot_history WHERE snapshot_at < ?",
-                (cutoff.isoformat(),),
+                "DELETE FROM market_snapshot_history WHERE trading_date < ?",
+                (latest_trading_date,),
             )
             return int(cursor.rowcount or 0)
 
     def market_snapshot_history_status(self) -> dict[str, Any]:
         rows = self.query(
             """
-            SELECT COUNT(*) AS count, MIN(snapshot_at) AS oldest_snapshot_at,
-                   MAX(snapshot_at) AS latest_snapshot_at, MAX(fetched_at) AS latest_fetched_at
+            SELECT COUNT(*) AS count,
+                   MIN(snapshot_at) AS oldest_snapshot_at,
+                   MAX(snapshot_at) AS latest_snapshot_at,
+                   MIN(trading_date) AS oldest_trading_date,
+                   MAX(trading_date) AS latest_trading_date,
+                   MAX(fetched_at) AS latest_fetched_at
             FROM market_snapshot_history
             """
         )
@@ -731,6 +795,8 @@ class Database:
             "count": 0,
             "oldest_snapshot_at": None,
             "latest_snapshot_at": None,
+            "oldest_trading_date": None,
+            "latest_trading_date": None,
             "latest_fetched_at": None,
         }
 
@@ -1006,6 +1072,173 @@ class Database:
         for row in rows:
             grouped.setdefault(str(row["symbol"]), []).append(dict(row))
         return grouped
+
+    def price_target_daily_update_leaders(
+        self,
+        *,
+        effective_date: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        target_date = (effective_date or "").strip()[:10]
+        if not target_date:
+            rows = self.query("SELECT MAX(effective_date) AS effective_date FROM price_target_events")
+            target_date = str(rows[0]["effective_date"] or "") if rows else ""
+        if not target_date:
+            return []
+        rows = self.query(
+            """
+            SELECT
+                e.symbol,
+                MAX(e.company_name) AS company_name,
+                COUNT(*) AS update_count,
+                COUNT(DISTINCT e.brokerage) AS brokerage_count,
+                AVG(e.target_price) AS average_target_price,
+                MAX(latest_bar.close) AS price_today,
+                CASE
+                    WHEN MAX(latest_bar.close) IS NULL OR MAX(latest_bar.close) = 0 THEN NULL
+                    ELSE (AVG(e.target_price) - MAX(latest_bar.close)) / MAX(latest_bar.close) * 100.0
+                END AS target_diff_pct
+            FROM price_target_events e
+            LEFT JOIN (
+                SELECT b.symbol, b.close
+                FROM daily_bars b
+                JOIN (
+                    SELECT symbol, MAX(trading_date) AS trading_date
+                    FROM daily_bars
+                    GROUP BY symbol
+                ) x ON x.symbol=b.symbol AND x.trading_date=b.trading_date
+            ) latest_bar ON latest_bar.symbol=e.symbol
+            WHERE e.effective_date = ?
+              AND e.target_price IS NOT NULL
+              AND e.target_price > 0
+            GROUP BY e.symbol
+            ORDER BY update_count DESC, brokerage_count DESC, average_target_price DESC
+            LIMIT ?
+            """,
+            (target_date, int(limit)),
+        )
+        return [dict(row) for row in rows]
+
+    def price_target_daily_average_leaders(
+        self,
+        *,
+        effective_date: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        target_date = (effective_date or "").strip()[:10]
+        if not target_date:
+            rows = self.query("SELECT MAX(effective_date) AS effective_date FROM price_target_events")
+            target_date = str(rows[0]["effective_date"] or "") if rows else ""
+        if not target_date:
+            return []
+        rows = self.query(
+            """
+            SELECT
+                e.symbol,
+                MAX(e.company_name) AS company_name,
+                COUNT(*) AS target_count,
+                AVG(e.target_price) AS average_target_price,
+                MAX(e.target_price) AS max_target_price,
+                MAX(latest_bar.close) AS price_today,
+                CASE
+                    WHEN MAX(latest_bar.close) IS NULL OR MAX(latest_bar.close) = 0 THEN NULL
+                    ELSE (AVG(e.target_price) - MAX(latest_bar.close)) / MAX(latest_bar.close) * 100.0
+                END AS target_diff_pct
+            FROM price_target_events e
+            LEFT JOIN (
+                SELECT b.symbol, b.close
+                FROM daily_bars b
+                JOIN (
+                    SELECT symbol, MAX(trading_date) AS trading_date
+                    FROM daily_bars
+                    GROUP BY symbol
+                ) x ON x.symbol=b.symbol AND x.trading_date=b.trading_date
+            ) latest_bar ON latest_bar.symbol=e.symbol
+            WHERE e.effective_date = ?
+              AND e.target_price IS NOT NULL
+              AND e.target_price > 0
+            GROUP BY e.symbol
+            ORDER BY average_target_price DESC, target_count DESC
+            LIMIT ?
+            """,
+            (target_date, int(limit)),
+        )
+        return [dict(row) for row in rows]
+
+    def price_target_strength_leaders(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT
+                p.symbol,
+                MAX(p.company_name) AS company_name,
+                COUNT(*) AS unreached_target_count,
+                AVG((p.target_price - COALESCE(m.price, latest_bar.close)) / COALESCE(m.price, latest_bar.close) * 100.0) AS average_upside_pct,
+                AVG(
+                    100.0 * POWER(
+                        0.5,
+                        MAX(
+                            julianday('now') - julianday(COALESCE(NULLIF(p.effective_date, ''), substr(p.captured_at, 1, 10))),
+                            0
+                        ) / 90.0
+                    )
+                ) AS recency_score,
+                AVG(p.target_price) AS average_target_price,
+                COALESCE(m.price, latest_bar.close) AS price_now
+            FROM price_targets_latest p
+            LEFT JOIN market_snapshots m ON m.symbol=p.symbol
+            LEFT JOIN (
+                SELECT b.symbol, b.trading_date, b.close
+                FROM daily_bars b
+                JOIN (
+                    SELECT symbol, MAX(trading_date) AS trading_date
+                    FROM daily_bars
+                    GROUP BY symbol
+                ) x ON x.symbol=b.symbol AND x.trading_date=b.trading_date
+            ) latest_bar ON latest_bar.symbol=p.symbol
+            LEFT JOIN (
+                SELECT
+                    p2.symbol,
+                    p2.brokerage,
+                    MIN(b.trading_date) AS reached_date
+                FROM price_targets_latest p2
+                JOIN daily_bars b ON b.symbol=p2.symbol
+                WHERE p2.target_price IS NOT NULL
+                  AND p2.effective_date <> ''
+                  AND b.trading_date >= p2.effective_date
+                  AND (
+                    (COALESCE(p2.price_then, p2.source_current_price, 0) <= p2.target_price AND b.high >= p2.target_price)
+                    OR
+                    (COALESCE(p2.price_then, p2.source_current_price, 0) > p2.target_price AND b.low <= p2.target_price)
+                  )
+                GROUP BY p2.symbol, p2.brokerage
+            ) reached ON reached.symbol=p.symbol AND reached.brokerage=p.brokerage
+            WHERE p.target_price IS NOT NULL
+              AND p.target_price > 0
+              AND COALESCE(m.price, latest_bar.close) IS NOT NULL
+              AND COALESCE(m.price, latest_bar.close) > 0
+              AND p.target_price > COALESCE(m.price, latest_bar.close)
+              AND reached.reached_date IS NULL
+            GROUP BY p.symbol
+            HAVING unreached_target_count > 0
+            """,
+        )
+        leaders: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            count_score = min(float(item.get("unreached_target_count") or 0) / 5.0, 1.0) * 100.0
+            upside_score = min(max(float(item.get("average_upside_pct") or 0), 0.0) / 25.0, 1.0) * 100.0
+            recency_score = float(item.get("recency_score") or 0.0)
+            item["target_strength"] = (count_score * 0.4) + (upside_score * 0.4) + (recency_score * 0.2)
+            leaders.append(item)
+        leaders.sort(
+            key=lambda item: (
+                float(item.get("target_strength") or 0),
+                float(item.get("average_upside_pct") or 0),
+                int(item.get("unreached_target_count") or 0),
+            ),
+            reverse=True,
+        )
+        return leaders[: int(limit)]
 
     def upsert_company_profile(self, profile: CompanyProfile) -> None:
         now = datetime.now(UTC).isoformat()

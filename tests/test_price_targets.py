@@ -73,6 +73,30 @@ def test_price_targets_upsert_average_and_reached_status(tmp_path):
     assert first["reached_date"] == "2026-07-09"
 
 
+def test_price_target_report_leaders(tmp_path):
+    database = Database(tmp_path / "notifier.db")
+    database.initialize()
+    database.sync_symbols([Symbol("AAA", "AAA Inc"), Symbol("BBB", "BBB Inc")])
+    database.upsert_bars(
+        [
+            DailyBar("AAA", date(2026, 7, 22), 90, 101, 89, 100, 1_000),
+            DailyBar("BBB", date(2026, 7, 22), 45, 51, 44, 50, 1_000),
+        ]
+    )
+    database.upsert_price_targets(
+        [
+            PriceTarget("AAA", "Broker 1", 130, price_then=90, effective_date="2026-07-22", captured_at="2026-07-22T20:00:00+00:00"),
+            PriceTarget("AAA", "Broker 2", 125, price_then=90, effective_date="2026-07-22", captured_at="2026-07-22T20:00:00+00:00"),
+            PriceTarget("BBB", "Broker 1", 60, price_then=45, effective_date="2026-07-22", captured_at="2026-07-22T20:00:00+00:00"),
+        ],
+        import_source="test",
+    )
+
+    assert database.price_target_daily_update_leaders(limit=5)[0]["symbol"] == "AAA"
+    assert database.price_target_daily_average_leaders(limit=5)[0]["symbol"] == "AAA"
+    assert database.price_target_strength_leaders(limit=10)[0]["symbol"] == "AAA"
+
+
 def test_import_price_targets_csv_does_not_replace_unknown_symbols(tmp_path):
     database = Database(tmp_path / "notifier.db")
     database.initialize()
