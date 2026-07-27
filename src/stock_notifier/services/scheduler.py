@@ -79,6 +79,12 @@ def default_schedule() -> dict[str, Any]:
         "weekdays": [0, 1, 2, 3, 4],
         "timezone": "America/Toronto",
         "notify_telegram": False,
+        "notify_buy": True,
+        "notify_watch": True,
+        "notify_sell": True,
+        "notify_filtered": True,
+        "buy_lists": [],
+        "sell_lists": [],
     }
 
 
@@ -87,6 +93,10 @@ def _clean_schedule(config: dict[str, Any]) -> dict[str, Any]:
     cleaned.update(config)
     cleaned["enabled"] = bool(cleaned.get("enabled"))
     cleaned["notify_telegram"] = bool(cleaned.get("notify_telegram"))
+    cleaned["notify_buy"] = bool(cleaned.get("notify_buy", True))
+    cleaned["notify_watch"] = bool(cleaned.get("notify_watch", True))
+    cleaned["notify_sell"] = bool(cleaned.get("notify_sell", True))
+    cleaned["notify_filtered"] = bool(cleaned.get("notify_filtered", True))
     try:
         cleaned["frequency_amount"] = max(int(cleaned.get("frequency_amount") or 1), 1)
     except (TypeError, ValueError):
@@ -109,6 +119,11 @@ def _clean_schedule(config: dict[str, Any]) -> dict[str, Any]:
         if 0 <= candidate <= 6 and candidate not in valid_weekdays:
             valid_weekdays.append(candidate)
     cleaned["weekdays"] = valid_weekdays or [0, 1, 2, 3, 4]
+    for key in ("buy_lists", "sell_lists"):
+        values = cleaned.get(key)
+        if not isinstance(values, list):
+            values = []
+        cleaned[key] = [str(value).strip() for value in values if str(value).strip()]
     return cleaned
 
 
@@ -895,6 +910,45 @@ def _signal_result_type(score: float, *, eligible: bool, buy_threshold: float, s
     return "Watch"
 
 
+def _signal_digest_types(schedule: dict[str, Any]) -> set[str]:
+    allowed: set[str] = set()
+    if bool(schedule.get("notify_buy", True)):
+        allowed.add("Buy")
+    if bool(schedule.get("notify_watch", True)):
+        allowed.add("Watch")
+    if bool(schedule.get("notify_sell", True)):
+        allowed.add("Sell")
+    if bool(schedule.get("notify_filtered", True)):
+        allowed.add("Filtered")
+    return allowed
+
+
+def _signal_alert_directions(schedule: dict[str, Any]) -> set[str]:
+    allowed: set[str] = set()
+    if bool(schedule.get("notify_buy", True)):
+        allowed.add("BUY")
+    if bool(schedule.get("notify_sell", True)):
+        allowed.add("SELL")
+    return allowed
+
+
+def _signal_direction_symbol_filters(database: Database, schedule: dict[str, Any]) -> dict[str, set[str] | None]:
+    filters: dict[str, set[str] | None] = {}
+    for direction, key in (("BUY", "buy_lists"), ("SELL", "sell_lists")):
+        lists = schedule.get(key)
+        selected_lists = [str(item).strip() for item in lists if str(item).strip()] if isinstance(lists, list) else []
+        filters[direction] = set(database.symbols_for_list_names(selected_lists)) if selected_lists else None
+    return filters
+
+
+def _direction_symbol_allowed(symbol: str, result_type: str, filters: dict[str, set[str] | None]) -> bool:
+    direction = result_type.upper()
+    if direction not in {"BUY", "SELL"}:
+        return True
+    allowed_symbols = filters.get(direction)
+    return allowed_symbols is None or symbol in allowed_symbols
+
+
 def _format_price(value: object) -> str:
     try:
         return f"${float(value):.2f}"
@@ -942,6 +996,9 @@ def _send_signal_digest_notification(
     dry_run: bool | None = None,
 ) -> bool:
     buy_threshold, sell_threshold = _alert_thresholds_for_signal(database, signal_name, settings)
+    schedule = get_signal_schedule(database, int(signal_id))
+    allowed_types = _signal_digest_types(schedule)
+    direction_filters = _signal_direction_symbol_filters(database, schedule)
     snapshot_rows = database.query(
         """
         SELECT symbol, price, percent_change, day_volume
@@ -955,17 +1012,24 @@ def _send_signal_digest_notification(
     )
     snapshot_by_symbol = {str(row["symbol"]): dict(row) for row in snapshot_rows}
     ranked = sorted(scores, key=lambda item: (bool(item.eligible), float(item.score)), reverse=True)
-    top = ranked[:10]
-    lines = ["Type      Sym     Score   Price     Pc%    Vol(M)"]
-    for item in top:
-        market = snapshot_by_symbol.get(str(item.symbol), {})
-        price = market.get("price", item.close)
+    filtered_ranked = []
+    for item in ranked:
         result_type = _signal_result_type(
             float(item.score),
             eligible=bool(item.eligible),
             buy_threshold=buy_threshold,
             sell_threshold=sell_threshold,
         )
+        if result_type not in allowed_types:
+            continue
+        if not _direction_symbol_allowed(str(item.symbol), result_type, direction_filters):
+            continue
+        filtered_ranked.append((item, result_type))
+    top = filtered_ranked[:10]
+    lines = ["Type      Sym     Score   Price     Pc%    Vol(M)"]
+    for item, result_type in top:
+        market = snapshot_by_symbol.get(str(item.symbol), {})
+        price = market.get("price", item.close)
         lines.append(
             f"{result_type[:8]:<8}  {str(item.symbol)[:6]:<6}  "
             f"{float(item.score):>5.1f}  {_format_price(price):>8}  "
@@ -973,12 +1037,12 @@ def _send_signal_digest_notification(
             f"{_format_volume_millions(market.get('day_volume')):>7}"
         )
     if not top:
-        lines.append("No scored symbols.")
+        lines.append("No symbols matched selected digest filters.")
     link_lines = []
     if settings.dashboard_base_url:
         link_lines.append(f'<a href="{escape(settings.dashboard_base_url)}">Dashboard</a>')
     if top:
-        link_lines.append("Links: " + " · ".join(_symbol_external_links(str(item.symbol)) for item in top))
+        link_lines.append("Links: " + " · ".join(_symbol_external_links(str(item.symbol)) for item, _ in top))
 
     text = (
         f"📊 <b>Signal results: {escape(signal_name)}</b>\n"
@@ -996,6 +1060,7 @@ def _send_signal_digest_notification(
         "signal_id": int(signal_id),
         "signal_name": signal_name,
         "top_count": len(top),
+        "result_types": sorted(allowed_types),
     }
     effective_dry_run = settings.alert_dry_run if dry_run is None else dry_run
     if effective_dry_run:
@@ -1031,16 +1096,24 @@ def run_signal_schedule(database: Database, settings: Settings, signal_id: int) 
         return ScheduledSignalResult(int(signal_id), f"Signal {signal_id}", True, False, "failed", "Signal not found")
     signal_name = str(signal_row["name"])
     try:
+        schedule = get_signal_schedule(database, int(signal_id))
         snapshots_fetched, snapshots_stored, snapshot_status = _refresh_signal_snapshots(database, settings, signal_row)
         scores = score_signal(database, signal_row, include_latest_snapshot=True)
-        alerts = scan_alerts(database, settings, signal_names={signal_name})
+        alert_directions = _signal_alert_directions(schedule)
+        alerts = scan_alerts(
+            database,
+            settings,
+            signal_names={signal_name},
+            allowed_directions=alert_directions,
+            symbols_by_direction=_signal_direction_symbol_filters(database, schedule),
+        )
         set_dashboard_setting(database, f"signals.{int(signal_id)}.last_scheduled_run_at", datetime.now(UTC).isoformat())
         alert_summary = (
             f"alerts={alerts.alerts_created}, queued={alerts.queued}, delivered={alerts.delivered}, "
             f"dry_run={alerts.dry_run}"
         )
         digest_sent = False
-        if bool(get_signal_schedule(database, int(signal_id)).get("notify_telegram")):
+        if bool(schedule.get("notify_telegram")):
             digest_sent = _send_signal_digest_notification(
                 database,
                 settings,

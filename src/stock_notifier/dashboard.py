@@ -2483,6 +2483,7 @@ def _render_signal_builder() -> None:
             due=is_signal_due(database, signal_id),
             last_run=_app_setting(f"signals.{signal_id}.last_scheduled_run_at", None),
             save_callback=lambda config, sid=signal_id: save_signal_schedule(database, sid, config),
+            signal_filters=True,
         )
         if st.button(
             "Test alert",
@@ -2901,6 +2902,7 @@ def _render_scheduler_form(
     due: bool,
     last_run: object,
     save_callback: object,
+    signal_filters: bool = False,
 ) -> None:
     unit_labels = {
         "minutes": "minutes",
@@ -2964,19 +2966,88 @@ def _render_scheduler_form(
                 selected_weekdays.append(int(weekday_value))
     else:
         selected_weekdays = weekdays
-    if st.button(f"Save {label} schedule", use_container_width=True, key=f"{key_prefix}_save_schedule"):
-        save_callback(
-            {
-                "enabled": enabled,
-                "frequency_amount": int(amount),
-                "frequency_unit": unit,
-                "start_time": start_time,
-                "end_time": end_time,
-                "weekdays": selected_weekdays,
-                "timezone": timezone,
-                "notify_telegram": notify,
-            }
+
+    notify_buy = bool(schedule.get("notify_buy", True))
+    notify_watch = bool(schedule.get("notify_watch", True))
+    notify_sell = bool(schedule.get("notify_sell", True))
+    notify_filtered = bool(schedule.get("notify_filtered", True))
+    buy_lists: list[str] = []
+    sell_lists: list[str] = []
+    if signal_filters:
+        st.markdown("##### Telegram result filters")
+        st.caption(
+            "Choose which result types are allowed in the scheduled signal digest and threshold alerts. "
+            "BUY/SELL list filters are optional; leave blank to allow that direction for the signal's full universe."
         )
+        type_cols = st.columns(4)
+        notify_buy = type_cols[0].checkbox(
+            "Buy",
+            value=notify_buy,
+            key=f"{key_prefix}_notify_buy",
+            help="Include Buy rows in the Telegram digest and allow BUY threshold alerts.",
+        )
+        notify_watch = type_cols[1].checkbox(
+            "Watch",
+            value=notify_watch,
+            key=f"{key_prefix}_notify_watch",
+            help="Include neutral/watch rows in the Telegram digest.",
+        )
+        notify_sell = type_cols[2].checkbox(
+            "Sell",
+            value=notify_sell,
+            key=f"{key_prefix}_notify_sell",
+            help="Include Sell rows in the Telegram digest and allow SELL threshold alerts.",
+        )
+        notify_filtered = type_cols[3].checkbox(
+            "Filtered",
+            value=notify_filtered,
+            key=f"{key_prefix}_notify_filtered",
+            help="Include rows that failed one or more gates.",
+        )
+        available_lists = [str(item["name"]) for item in database.list_symbol_lists()]
+        list_cols = st.columns(2)
+        saved_buy_lists = schedule.get("buy_lists")
+        saved_sell_lists = schedule.get("sell_lists")
+        buy_lists = list_cols[0].multiselect(
+            "BUY only for lists",
+            available_lists,
+            default=[item for item in saved_buy_lists if item in available_lists]
+            if isinstance(saved_buy_lists, list)
+            else [],
+            key=f"{key_prefix}_buy_lists",
+        )
+        sell_lists = list_cols[1].multiselect(
+            "SELL only for lists",
+            available_lists,
+            default=[item for item in saved_sell_lists if item in available_lists]
+            if isinstance(saved_sell_lists, list)
+            else [],
+            key=f"{key_prefix}_sell_lists",
+        )
+
+    if st.button(f"Save {label} schedule", use_container_width=True, key=f"{key_prefix}_save_schedule"):
+        config = {
+            "enabled": enabled,
+            "frequency_amount": int(amount),
+            "frequency_unit": unit,
+            "start_time": start_time,
+            "end_time": end_time,
+            "weekdays": selected_weekdays,
+            "timezone": timezone,
+            "notify_telegram": notify,
+        }
+        if signal_filters:
+            config.update(
+                {
+                    "notify_buy": notify_buy,
+                    "notify_watch": notify_watch,
+                    "notify_sell": notify_sell,
+                    "notify_filtered": notify_filtered,
+                    "buy_lists": buy_lists,
+                    "sell_lists": sell_lists,
+                }
+            )
+        save_callback(config)
         st.success(f"{label} schedule saved.")
         st.rerun()
     weekday_text = ""
@@ -2993,6 +3064,23 @@ def _render_scheduler_form(
         f"last scheduled run {_format_timestamp(last_run) or 'never'} · "
         f"{'due now' if due else 'not due'}"
     )
+    if signal_filters:
+        allowed = [
+            label
+            for label, enabled_flag in (
+                ("Buy", bool(schedule.get("notify_buy", True))),
+                ("Watch", bool(schedule.get("notify_watch", True))),
+                ("Sell", bool(schedule.get("notify_sell", True))),
+                ("Filtered", bool(schedule.get("notify_filtered", True))),
+            )
+            if enabled_flag
+        ]
+        st.caption(
+            "Signal Telegram filters: "
+            f"types={', '.join(allowed) if allowed else 'none'} · "
+            f"BUY lists={', '.join(schedule.get('buy_lists') or []) or 'all'} · "
+            f"SELL lists={', '.join(schedule.get('sell_lists') or []) or 'all'}"
+        )
 
 
 def _render_service_scheduler(service_key: str, label: str) -> None:

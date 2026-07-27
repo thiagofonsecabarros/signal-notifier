@@ -733,6 +733,8 @@ Saved signals can also have their own scheduler in **Signal Builder**. This sche
 - the signal scheduler controls when the signal is processed;
 - alert rules still control threshold crossing behavior;
 - the Telegram checkbox on the signal schedule controls whether a compact digest is sent after the scheduled run.
+- signal schedule filters control which result types are sent: Buy, Watch, Sell, and Filtered;
+- optional BUY/SELL list filters let you allow BUY alerts for one universe and SELL alerts only for a list such as `Portfolio`.
 
 When a scheduled signal is due, the services scheduler performs:
 
@@ -742,8 +744,8 @@ Massive full-market snapshot freshness check
 → update latest snapshots for that signal universe
 → append latest-valid-trading-day intraday snapshot history
 → score the signal using the refreshed snapshot as latest data
-→ evaluate alert rules for that signal only
-→ optionally send a compact Telegram digest
+→ evaluate allowed BUY/SELL alert directions for that signal only
+→ optionally send a compact Telegram digest filtered by selected result types/lists
 ```
 
 Snapshot reuse is intentionally conservative:

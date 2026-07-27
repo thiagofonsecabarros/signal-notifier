@@ -181,6 +181,8 @@ def _process_pending_alerts(
     now: datetime,
     dry_run: bool,
     signal_names: set[str] | None = None,
+    allowed_directions: set[str] | None = None,
+    symbols_by_direction: dict[str, set[str] | None] | None = None,
 ) -> tuple[int, int, int, int]:
     alerts_created = 0
     deliveries_attempted = 0
@@ -189,6 +191,12 @@ def _process_pending_alerts(
 
     for pending in database.pending_alerts_for_rules(signal_names=signal_names):
         direction = str(pending["direction"])
+        symbol = str(pending["symbol"])
+        if allowed_directions is not None and direction not in allowed_directions:
+            continue
+        allowed_symbols = (symbols_by_direction or {}).get(direction)
+        if allowed_symbols is not None and symbol not in allowed_symbols:
+            continue
         latest_score = pending.get("latest_score")
         if latest_score is None or not int(pending.get("latest_eligible") or 0):
             database.update_pending_alert_status(int(pending["id"]), "dropped")
@@ -251,6 +259,8 @@ def scan_alerts(
     dry_run: bool | None = None,
     now: datetime | None = None,
     signal_names: set[str] | None = None,
+    allowed_directions: set[str] | None = None,
+    symbols_by_direction: dict[str, set[str] | None] | None = None,
 ) -> AlertScanResult:
     effective_dry_run = settings.alert_dry_run if dry_run is None else dry_run
     database.upsert_notification_channel(
@@ -275,6 +285,8 @@ def scan_alerts(
         now=scan_time,
         dry_run=effective_dry_run,
         signal_names=signal_names,
+        allowed_directions=allowed_directions,
+        symbols_by_direction=symbols_by_direction,
     )
     alerts_created += pending_counts[0]
     deliveries_attempted += pending_counts[1]
@@ -288,6 +300,11 @@ def scan_alerts(
         symbol = str(score_row["symbol"])
 
         for direction, threshold_key in (("BUY", "buy_threshold"), ("SELL", "sell_threshold")):
+            if allowed_directions is not None and direction not in allowed_directions:
+                continue
+            allowed_symbols = (symbols_by_direction or {}).get(direction)
+            if allowed_symbols is not None and symbol not in allowed_symbols:
+                continue
             threshold = float(score_row[threshold_key])
             state = database.get_alert_state(signal_name, symbol, direction)
             if not int(score_row.get("eligible") or 0):
