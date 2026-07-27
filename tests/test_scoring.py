@@ -133,6 +133,8 @@ def test_signal_engine_supports_dollar_volume_gate_with_price_change_score():
     assert result.components[0].weight == 0
     assert result.components[0].contribution == 0
     assert result.score > 0
+    assert result.components[1].score <= 5
+    assert result.components[1].contribution <= 5
 
 
 def test_signal_engine_scores_price_target_expected_upside_from_current_price():
@@ -192,7 +194,8 @@ def test_signal_engine_scores_price_target_expected_upside_from_current_price():
     )[0]
 
     assert round(result.components[0].value or 0, 2) == 5.26
-    assert 50 < result.score < 60
+    assert round(result.components[0].score, 2) == 5.26
+    assert round(result.score, 2) == 5.26
 
 
 def test_signal_engine_price_target_gate_can_require_unreached_count():
@@ -250,6 +253,107 @@ def test_signal_engine_price_target_gate_can_require_unreached_count():
     assert result.components[0].value == 2
     assert result.components[0].score == 0
     assert result.score > 0
+
+
+def test_signal_engine_caps_score_components_before_weight():
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "trading_date": "2026-07-01",
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 1_000,
+            },
+            {
+                "symbol": "AAPL",
+                "trading_date": "2026-07-02",
+                "open": 124,
+                "high": 126,
+                "low": 123,
+                "close": 125.09,
+                "volume": 1_000,
+            },
+        ]
+    )
+    definition = SignalDefinition(
+        "Capped Momentum",
+        {
+            "components": [
+                {
+                    "name": "One day price change",
+                    "type": "price_change_pct",
+                    "mode": "score",
+                    "operator": ">=",
+                    "threshold": 0,
+                    "weight": 2,
+                    "score_min": 0,
+                    "score_max": 20,
+                    "params": {"days": 1},
+                }
+            ]
+        },
+    )
+
+    result = evaluate_signal(definition, {"AAPL": frame})[0]
+
+    assert round(result.components[0].value or 0, 2) == 25.09
+    assert result.components[0].score == 20
+    assert result.components[0].contribution == 40
+    assert result.score == 20
+
+
+def test_signal_engine_scales_overall_price_target_score_to_component_range():
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": "AAPL",
+                "trading_date": "2026-07-02",
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 1_000,
+            }
+        ]
+    )
+    definition = SignalDefinition(
+        "Scaled Target Strength",
+        {
+            "components": [
+                {
+                    "name": "Overall target strength",
+                    "type": "price_target",
+                    "mode": "score",
+                    "weight": 1,
+                    "score_min": 0,
+                    "score_max": 50,
+                    "params": {
+                        "metric": "target_score",
+                        "max_targets_for_score": 5,
+                        "max_upside_pct_for_score": 25,
+                        "recency_half_life_days": 90,
+                    },
+                }
+            ]
+        },
+    )
+
+    result = evaluate_signal(
+        definition,
+        {"AAPL": frame},
+        {
+            "AAPL": [
+                {"target_price": 150, "effective_date": "2026-07-01", "captured_at": "2026-07-01T20:00:00+00:00"}
+                for _ in range(10)
+            ]
+        },
+    )[0]
+
+    assert 0 <= result.components[0].score <= 50
+    assert result.components[0].contribution == result.components[0].score
 
 
 def test_scoring_service_seeds_and_persists_latest_scores(tmp_path):

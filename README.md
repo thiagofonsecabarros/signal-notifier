@@ -411,6 +411,14 @@ Market snapshot → liquidity signal/list → backfill liquid list → score/ale
 
 This avoids trying to score or backfill every ticker at once.
 
+Signal Builder preview counts distinguish between:
+
+- **Requested universe** — symbols selected by the signal universe, such as all active symbols or selected lists.
+- **History loaded / Evaluated** — symbols that currently have enough/loadable price history for the signal's required lookback.
+- **Skipped/no history** — requested symbols that were not evaluated because daily bars are missing.
+
+If the requested universe is much larger than the evaluated count, run **Services → Data ingestion: historical data** for that universe/list before relying on broad preview rankings.
+
 ## Signal Builder guide
 
 The Signal Builder lets you define a ranking formula without changing Python code. A signal is made of components. Each component calculates one technical value, then uses that value either as a pass/fail filter or as part of the final 0–100 score.
@@ -453,9 +461,8 @@ Score: Volume ratio            → ranks unusual volume higher
 | Threshold | The pass line. Example: `>= 0` for “above moving average”; `>= 25` for ADX trend strength; `>= 2` for 2x average volume. |
 | Weight | Importance of a score component. Weight 2 counts twice as much as weight 1. Ignored for gates. |
 | Period | Number of daily bars used for the indicator. In 15-minute scan cycles, the latest snapshot is appended as the current bar, but historical lookbacks are still daily bars in this version. |
+| Score min / Score max | Component score range/cap before Weight. For example, price change `25.09` with Score min `0` and Score max `20` scores `20` before weighting. If a score component has a Threshold and does not pass it, its score is `0`. For **Price target → Overall target score**, the internal target strength is already 0–100, so it is scaled into this output range; strength `92.65`, Score min `0`, Score max `50` produces about `46.33` before weighting. |
 | Slow period | For crossover components only. The main Period is the fast average; Slow period is the slower comparison average. |
-| Score min | Raw value that maps near 0 points for a score component. |
-| Score max | Raw value that maps near 100 points for a score component. |
 | Target metric | For Price Target components, choose whether the component uses overall target strength, unreached target count, average expected upside %, or recency score. |
 | Max target count | For Price Target overall score, number of unreached targets that maps the count sub-score to 100. |
 | Max upside % | For Price Target overall score, expected upside that maps the upside sub-score to 100. |
@@ -660,7 +667,7 @@ Score: Close vs EMA20, score min 0, score max 8
 - Start with gates to remove stocks you do not want, then use scores to rank the survivors.
 - Use `threshold = 0` for moving-average distance/crossover checks when you mean “above.”
 - Use ADX as trend strength, not direction. Combine it with MA or price-position gates for bullish/bearish context.
-- Keep score ranges realistic. If Score max is too high, everything scores low; if too low, everything maxes out at 100.
+- Keep score ranges realistic. Score max is the component cap before Weight, so use it to control how many points that component can add.
 - The scoring engine infers the recent history needed by each signal. For example, a 50-day relative-volume signal loads roughly the latest 55 daily bars per symbol, not all available historical data.
 - For the current E2.1.Micro VM, prefer filtered scan cycles such as `--max-symbols 50` to `500` until you confirm runtime is stable.
 

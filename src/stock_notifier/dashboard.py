@@ -1850,6 +1850,7 @@ def _component_from_inputs(index: int, default_component: dict[str, object] | No
     weight = 0.0
     score_min = float(default_component.get("score_min", defaults.get("score_min", 0.0)))
     score_max = float(default_component.get("score_max", defaults.get("score_max", 10.0)))
+    price_target_overall_score = component_type == "price_target" and str(locals().get("target_metric", "")) == "target_score"
     if mode == "score":
         with parameter_columns[2]:
             weight = st.number_input(
@@ -1864,14 +1865,22 @@ def _component_from_inputs(index: int, default_component: dict[str, object] | No
                 "Score min",
                 value=score_min,
                 key=f"component_score_min_{index}",
-                help="Normalization floor. A raw value at this level scores near 0.",
+                help=(
+                    "For Price target → Overall target score, this is the minimum output score after scaling the 0–100 target strength."
+                    if price_target_overall_score
+                    else "Component score floor/cap range. If a threshold is set and not passed, the score is 0."
+                ),
             )
         with parameter_columns[4]:
             score_max = st.number_input(
                 "Score max",
                 value=score_max,
                 key=f"component_score_max_{index}",
-                help="Normalization ceiling. A raw value at this level or better scores near 100.",
+                help=(
+                    "For Price target → Overall target score, this is the maximum output score. Example: target strength 92.65 with Score max 50 scores about 46.33."
+                    if price_target_overall_score
+                    else "Maximum component score before Weight. Example: price change 25 with Score max 20 scores 20."
+                ),
             )
     else:
         with parameter_columns[2]:
@@ -2083,6 +2092,7 @@ def _clear_signal_builder_preview_state() -> None:
     for key in [
         "signal_builder_preview_rows",
         "signal_builder_preview_components",
+        "signal_builder_preview_stats",
         "signal_builder_preview_label",
         "signal_builder_preview_detail_symbol",
         "signal_builder_preview_run_at",
@@ -2096,12 +2106,14 @@ def _preview_payload_from_results(
     results: list[object],
     label: str,
     config: dict[str, object],
+    stats: dict[str, object] | None = None,
     duration_seconds: float | None = None,
 ) -> dict[str, object]:
     return {
         "label": label,
         "run_at": datetime.now(UTC).isoformat(),
         "duration_seconds": duration_seconds,
+        "stats": stats or {},
         "config_json": json.dumps(config, sort_keys=True),
         "rows": [
             {
@@ -2136,6 +2148,7 @@ def _hydrate_signal_builder_preview_state(payload: dict[str, object] | None) -> 
         return
     st.session_state.signal_builder_preview_rows = payload.get("rows") or []
     st.session_state.signal_builder_preview_components = payload.get("components") or {}
+    st.session_state.signal_builder_preview_stats = payload.get("stats") or {}
     st.session_state.signal_builder_preview_label = payload.get("label") or "Preview"
     st.session_state.signal_builder_preview_run_at = payload.get("run_at") or ""
     st.session_state.signal_builder_preview_config_json = payload.get("config_json") or ""
@@ -2176,7 +2189,7 @@ def _raise_if_preview_cancelled() -> None:
         raise RuntimeError("Preview cancelled by user.")
 
 
-def _preview_signal_with_progress(preview_row: dict[str, object]) -> tuple[list[object], float]:
+def _preview_signal_with_progress(preview_row: dict[str, object]) -> tuple[list[object], float, dict[str, object]]:
     started = time.monotonic()
     progress = st.progress(0.0, text="Preparing preview...")
     status = st.empty()
@@ -2184,13 +2197,15 @@ def _preview_signal_with_progress(preview_row: dict[str, object]) -> tuple[list[
     _raise_if_preview_cancelled()
 
     symbols = _signal_preview_symbols(config)
-    progress.progress(0.1, text=f"Resolved preview universe: {len(symbols):,} symbols")
+    requested_count = len(symbols)
+    progress.progress(0.1, text=f"Resolved preview universe: {requested_count:,} requested symbols")
     if len(symbols) >= 1000:
         status.warning(
-            f"Large preview: {len(symbols):,} symbols. This can take several minutes because it loads historical bars and evaluates indicators."
+            f"Large preview: {requested_count:,} requested symbols. "
+            "The evaluated count may be lower if some symbols do not have enough historical bars for this signal."
         )
     else:
-        status.caption(f"Preview universe: {len(symbols):,} symbols")
+        status.caption(f"Preview universe: {requested_count:,} requested symbols")
     _raise_if_preview_cancelled()
 
     required_bars = required_history_bars(config)
@@ -2198,8 +2213,17 @@ def _preview_signal_with_progress(preview_row: dict[str, object]) -> tuple[list[
     history = database.load_price_history(symbols, min_bars=required_bars, include_latest_snapshot=False)
     _raise_if_preview_cancelled()
 
-    progress.progress(0.55, text=f"Loaded history for {len(history):,} symbols; building frames...")
+    loaded_history_count = len(history)
+    missing_history_count = max(requested_count - loaded_history_count, 0)
+    progress.progress(
+        0.55,
+        text=(
+            f"Loaded history for {loaded_history_count:,}/{requested_count:,} requested symbols; "
+            f"{missing_history_count:,} missing/no bars; building frames..."
+        ),
+    )
     frames = _history_frames_for_preview(history)
+    frame_count = len(frames)
     uses_price_targets = any(
         str(dict(component or {}).get("type") or "").strip() == "price_target"
         for component in list(config.get("components") or [])
@@ -2211,14 +2235,34 @@ def _preview_signal_with_progress(preview_row: dict[str, object]) -> tuple[list[
         signal_id=int(preview_row["id"] or 0),
         enabled=bool(preview_row["enabled"]),
     )
-    progress.progress(0.75, text=f"Evaluating signal components for {len(frames):,} symbols...")
+    progress.progress(
+        0.75,
+        text=f"Evaluating signal components for {frame_count:,}/{requested_count:,} requested symbols...",
+    )
     _raise_if_preview_cancelled()
 
     results = evaluate_signal(definition, frames, price_targets)
     duration = time.monotonic() - started
-    progress.progress(1.0, text=f"Preview complete: {len(results):,} scored symbols in {duration:.1f}s")
-    status.success(f"Preview complete in {duration:.1f}s. Scored {len(results):,} symbols.")
-    return results, duration
+    stats = {
+        "requested_symbols": requested_count,
+        "history_symbols": loaded_history_count,
+        "missing_history_symbols": missing_history_count,
+        "evaluated_symbols": frame_count,
+        "scored_symbols": len(results),
+        "required_bars": required_bars,
+    }
+    progress.progress(
+        1.0,
+        text=(
+            f"Preview complete: {len(results):,}/{requested_count:,} requested symbols scored "
+            f"({missing_history_count:,} skipped for missing/no history) in {duration:.1f}s"
+        ),
+    )
+    status.success(
+        f"Preview complete in {duration:.1f}s. "
+        f"Requested {requested_count:,}; evaluated {frame_count:,}; skipped {missing_history_count:,} missing/no-history symbols."
+    )
+    return results, duration, stats
 
 
 def _render_signal_builder() -> None:
@@ -2366,8 +2410,9 @@ def _render_signal_builder() -> None:
     preview_symbol_count = len(_signal_preview_symbols(generated_config))
     if preview_symbol_count >= 1000:
         st.warning(
-            f"Preview universe has {preview_symbol_count:,} symbols. Preview may take several minutes. "
-            "For faster iteration, use a selected list or build a liquidity list first."
+            f"Preview universe requests {preview_symbol_count:,} symbols. "
+            "The evaluated count may be lower if some symbols do not have enough historical bars. "
+            "For faster iteration, use a selected list or build/backfill a liquidity list first."
         )
 
     action_left, action_mid, action_right = st.columns([1, 1, 1])
@@ -2395,6 +2440,7 @@ def _render_signal_builder() -> None:
                                 "label": st.session_state.get("signal_builder_preview_label") or saved_name,
                                 "run_at": st.session_state.get("signal_builder_preview_run_at") or datetime.now(UTC).isoformat(),
                                 "duration_seconds": None,
+                                "stats": st.session_state.get("signal_builder_preview_stats") or {},
                                 "config_json": st.session_state.get("signal_builder_preview_config_json") or json.dumps(parsed_config, sort_keys=True),
                                 "rows": current_preview_rows,
                                 "components": st.session_state.get("signal_builder_preview_components") or {},
@@ -2428,11 +2474,12 @@ def _render_signal_builder() -> None:
                 "config": parsed_config,
                 "enabled": enabled,
             }
-            results, duration = _preview_signal_with_progress(preview_row)
+            results, duration, stats = _preview_signal_with_progress(preview_row)
             payload = _preview_payload_from_results(
                 results=results,
                 label=signal_name.strip() or "Preview",
                 config=parsed_config,
+                stats=stats,
                 duration_seconds=duration,
             )
             _save_signal_preview_payload(preview_storage_key, payload)
@@ -2454,6 +2501,18 @@ def _render_signal_builder() -> None:
         current_config_json = json.dumps(json.loads(config_text) if use_advanced_json else generated_config, sort_keys=True)
         if st.session_state.get("signal_builder_preview_config_json") and st.session_state.get("signal_builder_preview_config_json") != current_config_json:
             st.caption("This preview was run before the latest unsaved field changes. Run Preview rankings again to refresh it.")
+        preview_stats = st.session_state.get("signal_builder_preview_stats") or {}
+        if preview_stats:
+            metric_cols = st.columns(5)
+            metric_cols[0].metric("Requested universe", f"{int(preview_stats.get('requested_symbols') or 0):,}")
+            metric_cols[1].metric("History loaded", f"{int(preview_stats.get('history_symbols') or 0):,}")
+            metric_cols[2].metric("Skipped/no history", f"{int(preview_stats.get('missing_history_symbols') or 0):,}")
+            metric_cols[3].metric("Evaluated", f"{int(preview_stats.get('evaluated_symbols') or 0):,}")
+            metric_cols[4].metric("Required bars", f"{int(preview_stats.get('required_bars') or 0):,}")
+            st.caption(
+                "Preview rankings evaluate only symbols with loadable price history. "
+                "If many symbols are skipped, run Historical data ingestion for the selected universe/list."
+            )
         preview = pd.DataFrame(preview_rows)
         st.dataframe(preview, use_container_width=True, hide_index=True)
         detail_options = [str(row["symbol"]) for row in preview_rows[:25]]

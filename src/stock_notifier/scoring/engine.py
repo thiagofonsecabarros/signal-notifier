@@ -9,10 +9,10 @@ import pandas as pd
 
 from stock_notifier.scoring.indicators import (
     adx,
+    clamp,
     distance_pct,
     ema,
     price_change_pct,
-    scale_score,
     sma,
     volume_ratio,
 )
@@ -270,16 +270,35 @@ def _component_result(
     else:
         score_min = _as_float(component.get("score_min"))
         score_max = _as_float(component.get("score_max"))
-        if score_min is None:
-            score_min = threshold if threshold is not None else 0.0
-        if score_max is None:
-            score_max = score_min + 10.0
-        score = scale_score(
-            value,
-            low=score_min,
-            high=score_max,
-            direction=str(component.get("direction") or "higher"),
-        )
+        output_min = score_min if score_min is not None else 0.0
+        output_max = score_max if score_max is not None else 100.0
+        params = dict(component.get("params") or {})
+        metric = str(params.get("metric") or "target_score")
+        if value is None or (threshold is not None and not passed):
+            score = 0.0
+        elif component_type == "price_target" and metric == "target_score":
+            # The overall price-target metric is already a normalized 0-100
+            # composite. Treat score_min/score_max as the output score range
+            # for this component, not as raw-value normalization thresholds.
+            # Example: raw strength 92.65 with score_min=0 and score_max=50
+            # contributes 46.325 before weighting.
+            normalized = clamp(float(value)) / 100.0
+            score = output_min + normalized * (output_max - output_min)
+        else:
+            low = min(output_min, output_max)
+            high = max(output_min, output_max)
+            if math.isclose(low, high):
+                score = low
+            elif str(component.get("direction") or "higher") == "lower":
+                raw = float(value)
+                if raw <= low:
+                    score = high
+                elif raw >= high:
+                    score = low
+                else:
+                    score = high - (raw - low)
+            else:
+                score = min(max(float(value), low), high)
         contribution = score * weight
 
     if value is None:
