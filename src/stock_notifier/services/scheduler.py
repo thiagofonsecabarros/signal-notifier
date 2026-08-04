@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time as dt_time, timedelta
 from html import escape
+from string import Formatter
 from typing import Any
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -31,6 +32,59 @@ SERVICE_RUN_NAMES = {
 }
 SCHEDULE_UNITS = ["minutes", "hours", "days", "business_days", "weeks"]
 SIGNAL_SNAPSHOT_FRESH_MINUTES = 14
+OLD_SIGNAL_NOTIFICATION_TEMPLATE = """📊 <b>Signal results: {signal_name}</b>
+Snapshot: {snapshot_status}; api_fetched={snapshots_fetched}, updated={snapshots_stored}
+Scored: {scored_count} · {alert_summary}
+
+<pre>{results_table}</pre>
+{links}"""
+DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE = """📊 <b>Signal results: {signal_name}</b>
+Snapshot: {snapshot_status}; api_fetched={snapshots_fetched}, updated={snapshots_stored}
+Scored: {scored_count} · {alert_summary}
+
+<b>SIGNAL RESULTS</b>
+<pre>{results_table}</pre>
+
+<b>CHANGES FROM LAST UPDATE</b>
+<pre>{changes_table}</pre>
+{links}"""
+SIGNAL_NOTIFICATION_VARIABLES = [
+    "signal_name",
+    "run_time",
+    "snapshot_status",
+    "snapshots_fetched",
+    "snapshots_stored",
+    "scored_count",
+    "top_count",
+    "alert_summary",
+    "results_table",
+    "changes_table",
+    "links",
+    "dashboard_link",
+    "buy_count",
+    "watch_count",
+    "sell_count",
+    "filtered_count",
+    "top_symbols",
+]
+SIGNAL_RESULT_TABLE_COLUMNS = {
+    "type": {"label": "Type", "emoji": "", "width": 8, "align": "left"},
+    "symbol": {"label": "Sym", "emoji": "", "width": 6, "align": "left"},
+    "score": {"label": "Score", "emoji": "", "width": 6, "align": "right"},
+    "price": {"label": "Price", "emoji": "", "width": 9, "align": "right"},
+    "change_pct": {"label": "Pc%", "emoji": "", "width": 7, "align": "right"},
+    "volume_m": {"label": "Vol(M)", "emoji": "", "width": 8, "align": "right"},
+    "tv": {"label": "TV", "emoji": "📈", "width": 4, "align": "left"},
+    "yahoo": {"label": "YH", "emoji": "🟣", "width": 4, "align": "left"},
+}
+DEFAULT_SIGNAL_RESULT_TABLE_COLUMNS = [
+    {"key": "type", "label": "Type", "emoji": ""},
+    {"key": "symbol", "label": "Sym", "emoji": ""},
+    {"key": "score", "label": "Score", "emoji": ""},
+    {"key": "price", "label": "Price", "emoji": ""},
+    {"key": "change_pct", "label": "Pc%", "emoji": ""},
+    {"key": "volume_m", "label": "Vol(M)", "emoji": ""},
+]
 
 
 @dataclass(frozen=True)
@@ -85,7 +139,37 @@ def default_schedule() -> dict[str, Any]:
         "notify_filtered": True,
         "buy_lists": [],
         "sell_lists": [],
+        "notification_template": DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE,
+        "result_table_columns": DEFAULT_SIGNAL_RESULT_TABLE_COLUMNS,
     }
+
+
+def clean_signal_result_table_columns(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return [dict(item) for item in DEFAULT_SIGNAL_RESULT_TABLE_COLUMNS]
+    cleaned: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in value:
+        if isinstance(item, dict):
+            key = str(item.get("key") or "").strip()
+            label = str(item.get("label") or "").strip()
+            emoji = str(item.get("emoji") or "").strip()
+        else:
+            key = str(item or "").strip()
+            label = ""
+            emoji = ""
+        if key not in SIGNAL_RESULT_TABLE_COLUMNS or key in seen:
+            continue
+        defaults = SIGNAL_RESULT_TABLE_COLUMNS[key]
+        cleaned.append(
+            {
+                "key": key,
+                "label": label or str(defaults["label"]),
+                "emoji": emoji,
+            }
+        )
+        seen.add(key)
+    return cleaned or [dict(item) for item in DEFAULT_SIGNAL_RESULT_TABLE_COLUMNS]
 
 
 def _clean_schedule(config: dict[str, Any]) -> dict[str, Any]:
@@ -107,6 +191,10 @@ def _clean_schedule(config: dict[str, Any]) -> dict[str, Any]:
     cleaned["start_time"] = str(cleaned.get("start_time") or "09:45")
     cleaned["end_time"] = str(cleaned.get("end_time") or "16:00")
     cleaned["timezone"] = str(cleaned.get("timezone") or "America/Toronto")
+    cleaned["notification_template"] = str(cleaned.get("notification_template") or DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE)
+    if cleaned["notification_template"].strip() == OLD_SIGNAL_NOTIFICATION_TEMPLATE.strip():
+        cleaned["notification_template"] = DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE
+    cleaned["result_table_columns"] = clean_signal_result_table_columns(cleaned.get("result_table_columns"))
     weekdays = cleaned.get("weekdays")
     if not isinstance(weekdays, list):
         weekdays = [0, 1, 2, 3, 4]
@@ -963,6 +1051,29 @@ def _format_percent(value: object) -> str:
         return "-"
 
 
+def _format_signed_percent(value: object) -> str:
+    try:
+        return f"{float(value):+.1f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _format_signed_number(value: object, decimals: int = 1) -> str:
+    try:
+        return f"{float(value):+.{int(decimals)}f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _format_signed_price(value: object) -> str:
+    try:
+        candidate = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    sign = "+" if candidate >= 0 else "-"
+    return f"{sign}${abs(candidate):.2f}"
+
+
 def _format_volume_millions(value: object) -> str:
     try:
         return f"{float(value) / 1_000_000:.2f}"
@@ -982,7 +1093,188 @@ def _symbol_external_links(symbol: str) -> str:
     )
 
 
-def _send_signal_digest_notification(
+def _telegram_html_link(url: str, label: str) -> str:
+    clean_url = str(url or "").strip()
+    if not clean_url:
+        return ""
+    return f'<a href="{escape(clean_url)}">{escape(label)}</a>'
+
+
+def _truncate_cell(value: str, width: int) -> str:
+    text = str(value)
+    if width <= 0 or len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "…"
+
+
+def _format_table_cell(value: str, *, width: int, align: str) -> str:
+    text = _truncate_cell(value, width)
+    if align == "right":
+        return text.rjust(width)
+    return text.ljust(width)
+
+
+def _signal_digest_state_key(signal_id: int) -> str:
+    return f"signals.{int(signal_id)}.last_digest_rows"
+
+
+def _signal_digest_row(item: Any, result_type: str, market: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(item.symbol).upper().strip()
+    price = market.get("price", item.close)
+    return {
+        "symbol": symbol,
+        "type": result_type,
+        "score": float(item.score),
+        "price": float(price) if price not in (None, "") else None,
+        "percent_change": float(market["percent_change"]) if market.get("percent_change") not in (None, "") else None,
+        "day_volume": float(market["day_volume"]) if market.get("day_volume") not in (None, "") else None,
+    }
+
+
+def _render_signal_changes_table(
+    *,
+    current_rows: list[dict[str, Any]],
+    previous_rows: list[dict[str, Any]],
+) -> str:
+    header = (
+        f"{'Sym':<6}  "
+        f"{'Vol(M)':>8}  "
+        f"{'Score':>6}  "
+        f"{'Price':>9}  "
+        f"{'Change':>8}"
+    )
+    if not previous_rows:
+        return "\n".join([header, "No prior signal digest available."])
+
+    previous_by_symbol = {str(row.get("symbol") or "").upper(): row for row in previous_rows}
+    current_by_symbol = {str(row.get("symbol") or "").upper(): row for row in current_rows}
+    ordered_symbols: list[str] = []
+    for row in current_rows:
+        symbol = str(row.get("symbol") or "").upper()
+        if symbol and symbol not in ordered_symbols:
+            ordered_symbols.append(symbol)
+    for row in previous_rows:
+        symbol = str(row.get("symbol") or "").upper()
+        if symbol and symbol not in current_by_symbol and symbol not in ordered_symbols:
+            ordered_symbols.append(symbol)
+
+    lines = [header]
+    for symbol in ordered_symbols:
+        current = current_by_symbol.get(symbol)
+        previous = previous_by_symbol.get(symbol)
+        if current and not previous:
+            volume_delta = score_delta = price_delta = change_delta = "NEW"
+        elif previous and not current:
+            volume_delta = score_delta = price_delta = change_delta = "OUT"
+        else:
+            current_volume = current.get("day_volume") if current else None
+            previous_volume = previous.get("day_volume") if previous else None
+            current_score = current.get("score") if current else None
+            previous_score = previous.get("score") if previous else None
+            current_price = current.get("price") if current else None
+            previous_price = previous.get("price") if previous else None
+            current_change = current.get("percent_change") if current else None
+            previous_change = previous.get("percent_change") if previous else None
+            volume_delta = (
+                _format_signed_number((float(current_volume) - float(previous_volume)) / 1_000_000, 2)
+                if current_volume is not None and previous_volume is not None
+                else "-"
+            )
+            score_delta = (
+                _format_signed_number(float(current_score) - float(previous_score), 1)
+                if current_score is not None and previous_score is not None
+                else "-"
+            )
+            price_delta = (
+                _format_signed_price(float(current_price) - float(previous_price))
+                if current_price is not None and previous_price is not None
+                else "-"
+            )
+            change_delta = (
+                _format_signed_percent(float(current_change) - float(previous_change))
+                if current_change is not None and previous_change is not None
+                else "-"
+            )
+        lines.append(
+            f"{symbol[:6]:<6}  "
+            f"{volume_delta:>8}  "
+            f"{score_delta:>6}  "
+            f"{price_delta:>9}  "
+            f"{change_delta:>8}"
+        )
+    return "\n".join(lines)
+
+
+def _signal_table_cell(column_key: str, item: Any, result_type: str, market: dict[str, Any]) -> str:
+    symbol = str(item.symbol).upper().strip()
+    if column_key == "type":
+        return result_type
+    if column_key == "symbol":
+        return symbol
+    if column_key == "score":
+        return f"{float(item.score):.1f}"
+    if column_key == "price":
+        return _format_price(market.get("price", item.close))
+    if column_key == "change_pct":
+        return _format_percent(market.get("percent_change"))
+    if column_key == "volume_m":
+        return _format_volume_millions(market.get("day_volume"))
+    if column_key == "tv":
+        url = f"https://www.tradingview.com/chart/?symbol={quote(symbol, safe='')}"
+        return f'<a href="{escape(url)}">📈</a>'
+    if column_key == "yahoo":
+        url = f"https://finance.yahoo.com/quote/{quote(symbol, safe='')}"
+        return f'<a href="{escape(url)}">YH</a>'
+    return "-"
+
+
+def _render_signal_results_table(
+    *,
+    top: list[tuple[Any, str]],
+    snapshot_by_symbol: dict[str, dict[str, Any]],
+    columns: list[dict[str, str]],
+) -> str:
+    active_columns = clean_signal_result_table_columns(columns)
+    header_cells: list[str] = []
+    for column in active_columns:
+        key = str(column["key"])
+        defaults = SIGNAL_RESULT_TABLE_COLUMNS[key]
+        label = f"{column.get('emoji', '')} {column.get('label', defaults['label'])}".strip()
+        header_cells.append(
+            _format_table_cell(
+                label,
+                width=int(defaults["width"]),
+                align=str(defaults["align"]),
+            )
+        )
+    lines = ["  ".join(header_cells)]
+    for item, result_type in top:
+        market = snapshot_by_symbol.get(str(item.symbol), {})
+        row_cells: list[str] = []
+        for column in active_columns:
+            key = str(column["key"])
+            defaults = SIGNAL_RESULT_TABLE_COLUMNS[key]
+            value = _signal_table_cell(key, item, result_type, market)
+            # HTML anchor cells should not be truncated/padded, otherwise the tag can break.
+            if key in {"tv", "yahoo"}:
+                row_cells.append(value)
+            else:
+                row_cells.append(
+                    _format_table_cell(
+                        value,
+                        width=int(defaults["width"]),
+                        align=str(defaults["align"]),
+                    )
+                )
+        lines.append("  ".join(row_cells))
+    if not top:
+        lines.append("No symbols matched selected digest filters.")
+    return "\n".join(lines)
+
+
+def _build_signal_digest_context(
     database: Database,
     settings: Settings,
     *,
@@ -993,8 +1285,7 @@ def _send_signal_digest_notification(
     snapshots_stored: int,
     snapshot_status: str,
     alert_summary: str,
-    dry_run: bool | None = None,
-) -> bool:
+) -> dict[str, Any]:
     buy_threshold, sell_threshold = _alert_thresholds_for_signal(database, signal_name, settings)
     schedule = get_signal_schedule(database, int(signal_id))
     allowed_types = _signal_digest_types(schedule)
@@ -1013,6 +1304,7 @@ def _send_signal_digest_notification(
     snapshot_by_symbol = {str(row["symbol"]): dict(row) for row in snapshot_rows}
     ranked = sorted(scores, key=lambda item: (bool(item.eligible), float(item.score)), reverse=True)
     filtered_ranked = []
+    type_counts = {"Buy": 0, "Watch": 0, "Sell": 0, "Filtered": 0}
     for item in ranked:
         result_type = _signal_result_type(
             float(item.score),
@@ -1020,37 +1312,112 @@ def _send_signal_digest_notification(
             buy_threshold=buy_threshold,
             sell_threshold=sell_threshold,
         )
+        if result_type in type_counts:
+            type_counts[result_type] += 1
         if result_type not in allowed_types:
             continue
         if not _direction_symbol_allowed(str(item.symbol), result_type, direction_filters):
             continue
         filtered_ranked.append((item, result_type))
     top = filtered_ranked[:10]
-    lines = ["Type      Sym     Score   Price     Pc%    Vol(M)"]
-    for item, result_type in top:
-        market = snapshot_by_symbol.get(str(item.symbol), {})
-        price = market.get("price", item.close)
-        lines.append(
-            f"{result_type[:8]:<8}  {str(item.symbol)[:6]:<6}  "
-            f"{float(item.score):>5.1f}  {_format_price(price):>8}  "
-            f"{_format_percent(market.get('percent_change')):>6}  "
-            f"{_format_volume_millions(market.get('day_volume')):>7}"
-        )
-    if not top:
-        lines.append("No symbols matched selected digest filters.")
+    current_digest_rows = [
+        _signal_digest_row(item, result_type, snapshot_by_symbol.get(str(item.symbol), {}))
+        for item, result_type in top
+    ]
+    previous_payload = database.get_app_setting(_signal_digest_state_key(int(signal_id)), {})
+    previous_digest_rows = (
+        previous_payload.get("rows")
+        if isinstance(previous_payload, dict) and isinstance(previous_payload.get("rows"), list)
+        else []
+    )
+    result_table = _render_signal_results_table(
+        top=top,
+        snapshot_by_symbol=snapshot_by_symbol,
+        columns=schedule.get("result_table_columns") or DEFAULT_SIGNAL_RESULT_TABLE_COLUMNS,
+    )
+    changes_table = _render_signal_changes_table(
+        current_rows=current_digest_rows,
+        previous_rows=previous_digest_rows,
+    )
+    dashboard_link = _telegram_html_link(settings.dashboard_base_url, "Dashboard") if settings.dashboard_base_url else ""
     link_lines = []
-    if settings.dashboard_base_url:
-        link_lines.append(f'<a href="{escape(settings.dashboard_base_url)}">Dashboard</a>')
+    if dashboard_link:
+        link_lines.append(dashboard_link)
     if top:
         link_lines.append("Links: " + " · ".join(_symbol_external_links(str(item.symbol)) for item, _ in top))
+    return {
+        "signal_name": signal_name,
+        "run_time": datetime.now(UTC).isoformat(timespec="seconds"),
+        "snapshot_status": snapshot_status,
+        "snapshots_fetched": f"{snapshots_fetched:,}",
+        "snapshots_stored": f"{snapshots_stored:,}",
+        "scored_count": f"{len(scores):,}",
+        "top_count": str(len(top)),
+        "alert_summary": alert_summary,
+        "results_table": result_table,
+        "changes_table": changes_table,
+        "links": "\n".join(link_lines),
+        "dashboard_link": dashboard_link,
+        "buy_count": f"{type_counts['Buy']:,}",
+        "watch_count": f"{type_counts['Watch']:,}",
+        "sell_count": f"{type_counts['Sell']:,}",
+        "filtered_count": f"{type_counts['Filtered']:,}",
+        "top_symbols": ", ".join(str(item.symbol) for item, _ in top),
+        "top": top,
+        "digest_rows": current_digest_rows,
+        "previous_digest_rows": previous_digest_rows,
+        "allowed_types": allowed_types,
+    }
 
-    text = (
-        f"📊 <b>Signal results: {escape(signal_name)}</b>\n"
-        f"Snapshot: {escape(snapshot_status)}; api_fetched={snapshots_fetched:,}, updated={snapshots_stored:,}\n"
-        f"Scored: {len(scores):,} · {escape(alert_summary)}\n"
-        f"<pre>{escape(chr(10).join(lines))}</pre>\n"
-        f"{chr(10).join(link_lines)}"
+
+def render_signal_notification_template(template: str, context: dict[str, Any]) -> str:
+    safe_context = {
+        key: value
+        for key, value in context.items()
+        if key in set(SIGNAL_NOTIFICATION_VARIABLES) and key not in {"results_table", "changes_table", "links", "dashboard_link"}
+    }
+    render_context = {key: escape(str(value)) for key, value in safe_context.items()}
+    for trusted_key in ("results_table", "changes_table", "links", "dashboard_link"):
+        render_context[trusted_key] = str(context.get(trusted_key) or "")
+    variables = {field_name for _, field_name, _, _ in Formatter().parse(template or "") if field_name}
+    for variable in variables:
+        render_context.setdefault(variable, "")
+    return (template or DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE).format_map(render_context)
+
+
+def _send_signal_digest_notification(
+    database: Database,
+    settings: Settings,
+    *,
+    signal_id: int,
+    signal_name: str,
+    scores: list[Any],
+    snapshots_fetched: int,
+    snapshots_stored: int,
+    snapshot_status: str,
+    alert_summary: str,
+    dry_run: bool | None = None,
+    update_digest_state: bool = True,
+) -> bool:
+    schedule = get_signal_schedule(database, int(signal_id))
+    context = _build_signal_digest_context(
+        database,
+        settings,
+        signal_id=signal_id,
+        signal_name=signal_name,
+        scores=scores,
+        snapshots_fetched=snapshots_fetched,
+        snapshots_stored=snapshots_stored,
+        snapshot_status=snapshot_status,
+        alert_summary=alert_summary,
     )
+    try:
+        text = render_signal_notification_template(
+            str(schedule.get("notification_template") or DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE),
+            context,
+        )
+    except Exception:
+        text = render_signal_notification_template(DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE, context)
     request_payload = {
         "chat_id": settings.telegram_chat_id,
         "text": text,
@@ -1059,8 +1426,8 @@ def _send_signal_digest_notification(
         "kind": "scheduled-signal-digest",
         "signal_id": int(signal_id),
         "signal_name": signal_name,
-        "top_count": len(top),
-        "result_types": sorted(allowed_types),
+        "top_count": len(context.get("top") or []),
+        "result_types": sorted(context.get("allowed_types") or []),
     }
     effective_dry_run = settings.alert_dry_run if dry_run is None else dry_run
     if effective_dry_run:
@@ -1087,6 +1454,16 @@ def _send_signal_digest_notification(
         response=result.response,
         error_text=result.error_text,
     )
+    if result.ok and update_digest_state:
+        database.set_app_setting(
+            _signal_digest_state_key(int(signal_id)),
+            {
+                "signal_id": int(signal_id),
+                "signal_name": signal_name,
+                "sent_at": datetime.now(UTC).isoformat(),
+                "rows": context.get("digest_rows") or [],
+            },
+        )
     return result.ok
 
 
@@ -1181,6 +1558,7 @@ def run_signal_test_alert(
             snapshot_status=snapshot_status,
             alert_summary="test alert digest",
             dry_run=dry_run,
+            update_digest_state=False,
         )
         message = (
             f"Test alert digest complete: signal={signal_name}, scored={len(scores):,}, "

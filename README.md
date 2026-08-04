@@ -742,6 +742,11 @@ Saved signals can also have their own scheduler in **Signal Builder**. This sche
 - the Telegram checkbox on the signal schedule controls whether a compact digest is sent after the scheduled run.
 - signal schedule filters control which result types are sent: Buy, Watch, Sell, and Filtered;
 - optional BUY/SELL list filters let you allow BUY alerts for one universe and SELL alerts only for a list such as `Portfolio`.
+- the **Notification Builder** lets each signal save a custom Telegram HTML template with a live preview and variables such as `{signal_name}`, `{results_table}`, `{changes_table}`, `{links}`, `{buy_count}`, `{sell_count}`, and `{top_symbols}`.
+- the **Results table builder** inside the Notification Builder controls `{results_table}`: choose columns, set their order, rename headers, and add emojis. Available columns include result type, symbol, score, price, change %, volume in millions, TradingView icon link, and Yahoo Finance icon link.
+- the default Telegram digest includes two bold sections: **SIGNAL RESULTS** for the current top rows and **CHANGES FROM LAST UPDATE** for changes versus the last successfully delivered digest for the same signal. The change table shows deltas for Vol(M), Score, Price, and Change; `NEW` for new symbols; and `OUT` for symbols that disappeared.
+
+Telegram templates support emojis and Telegram-safe HTML tags such as `<b>`, `<i>`, `<u>`, `<code>`, `<pre>`, and `<a href="...">link</a>`. Use double braces like `{{` and `}}` when you want literal braces instead of a variable. If a saved template cannot be rendered, the scheduler falls back to the default digest.
 
 When a scheduled signal is due, the services scheduler performs:
 

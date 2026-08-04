@@ -4,6 +4,7 @@ import json
 import sqlite3
 import time
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import altair as alt
@@ -20,7 +21,12 @@ from stock_notifier.scoring.engine import SignalDefinition, evaluate_signal
 from stock_notifier.scoring.service import required_history_bars, score_signal, seed_starter_signals
 from stock_notifier.services.price_targets import fetch_and_store_price_targets
 from stock_notifier.services.scheduler import (
+    DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE,
+    DEFAULT_SIGNAL_RESULT_TABLE_COLUMNS,
     SCHEDULE_UNITS,
+    SIGNAL_NOTIFICATION_VARIABLES,
+    SIGNAL_RESULT_TABLE_COLUMNS,
+    clean_signal_result_table_columns,
     get_service_schedule,
     get_signal_schedule,
     is_service_due,
@@ -28,6 +34,8 @@ from stock_notifier.services.scheduler import (
     run_signal_test_alert,
     save_service_schedule,
     save_signal_schedule,
+    render_signal_notification_template,
+    _render_signal_results_table,
     _send_price_target_report_notification,
 )
 
@@ -3032,6 +3040,10 @@ def _render_scheduler_form(
     notify_filtered = bool(schedule.get("notify_filtered", True))
     buy_lists: list[str] = []
     sell_lists: list[str] = []
+    notification_template = str(schedule.get("notification_template") or DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE)
+    result_table_columns = clean_signal_result_table_columns(
+        schedule.get("result_table_columns") or DEFAULT_SIGNAL_RESULT_TABLE_COLUMNS
+    )
     if signal_filters:
         st.markdown("##### Telegram result filters")
         st.caption(
@@ -3083,6 +3095,139 @@ def _render_scheduler_form(
             else [],
             key=f"{key_prefix}_sell_lists",
         )
+        with st.expander("Notification Builder", expanded=False):
+            st.caption(
+                "Customize the Telegram digest for this signal. Telegram supports emojis and safe HTML tags such as "
+                "`<b>`, `<i>`, `<u>`, `<code>`, `<pre>`, and `<a href=\"...\">link</a>`. "
+                "Use variables like `{signal_name}`, `{results_table}`, and `{changes_table}`."
+            )
+            st.markdown("**Results table builder**")
+            st.caption(
+                "Choose which columns appear inside `{results_table}`. The selected order below is the Telegram order. "
+                "You can add emojis to headers, rename labels, or include TradingView/Yahoo icon-link columns."
+            )
+            table_options = list(SIGNAL_RESULT_TABLE_COLUMNS.keys())
+            saved_table_keys = [
+                str(item.get("key"))
+                for item in result_table_columns
+                if isinstance(item, dict) and str(item.get("key")) in SIGNAL_RESULT_TABLE_COLUMNS
+            ]
+            selected_table_keys = st.multiselect(
+                "Columns",
+                table_options,
+                default=saved_table_keys or [str(item["key"]) for item in DEFAULT_SIGNAL_RESULT_TABLE_COLUMNS],
+                format_func=lambda key: str(SIGNAL_RESULT_TABLE_COLUMNS[str(key)]["label"]),
+                key=f"{key_prefix}_result_table_keys",
+                help="To change sequence, use the order field below. Available keys: "
+                + ", ".join(table_options),
+            )
+            default_order = ", ".join(selected_table_keys)
+            order_text = st.text_input(
+                "Column order",
+                value=default_order,
+                key=f"{key_prefix}_result_table_order",
+                help="Comma-separated keys. Example: type,symbol,score,price,change_pct,volume_m,tv,yahoo",
+            )
+            ordered_keys: list[str] = []
+            for raw_key in order_text.split(","):
+                clean_key = raw_key.strip()
+                if clean_key in selected_table_keys and clean_key not in ordered_keys:
+                    ordered_keys.append(clean_key)
+            for clean_key in selected_table_keys:
+                if clean_key not in ordered_keys:
+                    ordered_keys.append(clean_key)
+            existing_columns = {
+                str(item.get("key")): item
+                for item in result_table_columns
+                if isinstance(item, dict) and str(item.get("key")) in SIGNAL_RESULT_TABLE_COLUMNS
+            }
+            table_label_cols = st.columns(3)
+            edited_table_columns: list[dict[str, str]] = []
+            for index, column_key in enumerate(ordered_keys):
+                defaults = SIGNAL_RESULT_TABLE_COLUMNS[column_key]
+                existing = existing_columns.get(column_key, {})
+                with table_label_cols[index % 3]:
+                    emoji = st.text_input(
+                        f"{defaults['label']} emoji",
+                        value=str(existing.get("emoji") or ""),
+                        key=f"{key_prefix}_table_{column_key}_emoji",
+                        help="Optional emoji before the header label.",
+                    )
+                    custom_label = st.text_input(
+                        f"{defaults['label']} label",
+                        value=str(existing.get("label") or defaults["label"]),
+                        key=f"{key_prefix}_table_{column_key}_label",
+                    )
+                edited_table_columns.append(
+                    {"key": column_key, "label": custom_label.strip() or str(defaults["label"]), "emoji": emoji.strip()}
+                )
+            result_table_columns = clean_signal_result_table_columns(edited_table_columns)
+            sample_top = [
+                (
+                    SimpleNamespace(symbol="AAPL", score=82.4, close=210.12),
+                    "Buy",
+                ),
+                (
+                    SimpleNamespace(symbol="MSFT", score=61.8, close=505.31),
+                    "Watch",
+                ),
+            ]
+            sample_snapshots = {
+                "AAPL": {"price": 210.12, "percent_change": 2.4, "day_volume": 55_120_000},
+                "MSFT": {"price": 505.31, "percent_change": -0.7, "day_volume": 22_040_000},
+            }
+            sample_results_table = _render_signal_results_table(
+                top=sample_top,
+                snapshot_by_symbol=sample_snapshots,
+                columns=result_table_columns,
+            )
+            sample_changes_table = (
+                "Sym       Vol(M)   Score      Price    Change\n"
+                "AAPL         NEW     NEW        NEW       NEW\n"
+                "MSFT       +3.14    -2.6     +$1.92     +2.1%\n"
+                "TSLA         OUT     OUT        OUT       OUT"
+            )
+            builder_cols = st.columns([2, 1])
+            with builder_cols[0]:
+                notification_template = st.text_area(
+                    "Telegram message template",
+                    value=notification_template,
+                    height=260,
+                    key=f"{key_prefix}_notification_template",
+                    help="Saved with this signal schedule. Invalid or unknown variables render as blank.",
+                )
+            with builder_cols[1]:
+                st.markdown("**Available variables**")
+                st.code("\n".join("{" + item + "}" for item in SIGNAL_NOTIFICATION_VARIABLES), language="text")
+                if st.button("Reset to default template", key=f"{key_prefix}_reset_template", use_container_width=True):
+                    notification_template = DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE
+                    st.session_state[f"{key_prefix}_notification_template"] = DEFAULT_SIGNAL_NOTIFICATION_TEMPLATE
+                    st.rerun()
+            sample_context = {
+                "signal_name": label,
+                "run_time": datetime.now(UTC).isoformat(timespec="seconds"),
+                "snapshot_status": "sample snapshot reused/fetched",
+                "snapshots_fetched": "13,088",
+                "snapshots_stored": "250",
+                "scored_count": "250",
+                "top_count": "10",
+                "alert_summary": "alerts=0, queued=0, delivered=0, dry_run=True",
+                "results_table": sample_results_table,
+                "changes_table": sample_changes_table,
+                "links": 'Links: AAPL <a href="https://www.tradingview.com/chart/?symbol=AAPL">📈</a> <a href="https://finance.yahoo.com/quote/AAPL">YH</a>',
+                "dashboard_link": '<a href="http://dashboard.example">Dashboard</a>',
+                "buy_count": "4",
+                "watch_count": "12",
+                "sell_count": "0",
+                "filtered_count": "20",
+                "top_symbols": "AAPL, MSFT",
+            }
+            try:
+                preview_text = render_signal_notification_template(notification_template, sample_context)
+                st.markdown("**Telegram preview**")
+                st.code(preview_text, language="html")
+            except Exception as exc:
+                st.error(f"Template preview failed: {exc}")
 
     if st.button(f"Save {label} schedule", use_container_width=True, key=f"{key_prefix}_save_schedule"):
         config = {
@@ -3104,6 +3249,8 @@ def _render_scheduler_form(
                     "notify_filtered": notify_filtered,
                     "buy_lists": buy_lists,
                     "sell_lists": sell_lists,
+                    "notification_template": notification_template,
+                    "result_table_columns": result_table_columns,
                 }
             )
         save_callback(config)
